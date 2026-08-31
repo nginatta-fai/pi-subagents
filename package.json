@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Process-isolated scout, reviewer, and worker subagents for Pi",
   "type": "module",
   "keywords": [

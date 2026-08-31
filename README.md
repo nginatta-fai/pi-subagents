@@ -19,19 +19,19 @@ The target machine must have authentication and model access configured for thes
 Push this repository to a Git host, tag a release, and install it globally:
 
 ```bash
-pi install git:github.com/OWNER/pi-subagents@v0.1.0
+pi install git:github.com/nginatta-fai/pi-subagents@0.1.1
 ```
 
 A raw Git URL also works:
 
 ```bash
-pi install https://github.com/OWNER/pi-subagents@v0.1.0
+pi install https://github.com/nginatta-fai/pi-subagents@0.1.1
 ```
 
 Use `-l` to record the package in the current project's `.pi/settings.json` instead of global settings:
 
 ```bash
-pi install git:github.com/OWNER/pi-subagents@v0.1.0 -l
+pi install git:github.com/nginatta-fai/pi-subagents@0.1.1 -l
 ```
 
 After changing installed resources, start a new Pi session or run `/reload`.
@@ -53,7 +53,7 @@ pi --no-extensions -e ./extensions/subagents/index.ts
 After publishing the package:
 
 ```bash
-pi install npm:pi-subagents@0.1.0
+pi install npm:pi-subagents@0.1.1
 ```
 
 Inspect and manage installations with:
@@ -61,7 +61,7 @@ Inspect and manage installations with:
 ```bash
 pi list
 pi config
-pi remove git:github.com/OWNER/pi-subagents
+pi remove git:github.com/nginatta-fai/pi-subagents
 ```
 
 > Pi extensions execute with the full operating-system permissions of the Pi process. Review packages before installing them.
