@@ -19,19 +19,19 @@ The target machine must have authentication and model access configured for thes
 Push this repository to a Git host, tag a release, and install it globally:
 
 ```bash
-pi install git:github.com/nginatta-fai/pi-subagents@0.1.1
+pi install git:github.com/nginatta-fai/pi-subagents@0.1.2
 ```
 
 A raw Git URL also works:
 
 ```bash
-pi install https://github.com/nginatta-fai/pi-subagents@0.1.1
+pi install https://github.com/nginatta-fai/pi-subagents@0.1.2
 ```
 
 Use `-l` to record the package in the current project's `.pi/settings.json` instead of global settings:
 
 ```bash
-pi install git:github.com/nginatta-fai/pi-subagents@0.1.1 -l
+pi install git:github.com/nginatta-fai/pi-subagents@0.1.2 -l
 ```
 
 After changing installed resources, start a new Pi session or run `/reload`.
@@ -53,7 +53,7 @@ pi --no-extensions -e ./extensions/subagents/index.ts
 After publishing the package:
 
 ```bash
-pi install npm:pi-subagents@0.1.1
+pi install npm:pi-subagents@0.1.2
 ```
 
 Inspect and manage installations with:
@@ -82,6 +82,8 @@ Each invocation starts a separate ephemeral Pi process with:
 Subagent output and model usage are returned to the parent. Model-visible output is capped at 50 KiB; larger complete output is written to a private temporary file that is removed at session shutdown. Child cancellation propagates to the process tree. Mutating agents are serialized.
 
 Use `/subagents` to inspect the loaded catalogue.
+
+The routing policy makes `worker` the default executor for non-trivial implementation, fixes, refactors, and other code changes. Requests referring to prior findings by severity or item number should be delegated with those finding details copied into the isolated worker task. The main agent may implement directly only for trivial one-line changes or when explicitly told not to use subagents.
 
 The main agent can invoke subagents autonomously. Example prompts that exercise routing:
 

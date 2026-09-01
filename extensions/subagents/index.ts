@@ -601,14 +601,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			label: "Subagent",
 			description: [
 				"Delegate a self-contained task to one specialized agent running in an isolated Pi process and context window.",
+				"Routing policy: worker is the default executor for implementation, fixes, refactors, and other code changes; scout handles reconnaissance; reviewer handles independent review.",
 				"Choose the agent from this catalog:",
 				catalog,
 			].join("\n"),
-			promptSnippet: `Delegate specialized work to: ${agentNames.join(", ") || "configured subagents"}`,
+			promptSnippet: `Delegate specialized work to ${agentNames.join(", ") || "configured subagents"}; use worker by default for implementation and fixes`,
 			promptGuidelines: [
 				"Use subagent proactively when specialized investigation, independent review, or isolated implementation would materially improve the result; the user does not need to request delegation.",
-				"Give subagent a self-contained task with the relevant goal, constraints, and expected output.",
-				"Use scout for broad codebase reconnaissance, reviewer for an independent quality/security pass, and worker for delegated implementation.",
+				"For any non-trivial request to implement, fix, address, apply, refactor, add, modify, or update code, call subagent with the worker agent before editing files yourself. This includes requests that refer to previous review findings by severity or item number.",
+				"The main agent should coordinate and verify worker output rather than duplicate the implementation. Implement directly only for a trivial one-line change or when the user explicitly asks not to use subagents.",
+				"Give subagent a self-contained task with the relevant goal, constraints, and expected output. When the user refers to earlier findings or items, copy their concrete details into the worker task because the subagent cannot see the parent conversation.",
+				"Use scout for broad codebase reconnaissance, reviewer for an independent quality/security/performance pass, and worker as the default executor for implementation and fixes.",
 				"Do not invoke a mutating subagent in parallel with another subagent operating on the same working tree.",
 			],
 			parameters: Type.Object({
