@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Default executor for implementation, fixes, refactors, and other code changes, with full coding tools
-model: openai-codex/gpt-5.6-luna
+model: openai-codex/gpt-6-luna
 thinking: xhigh
 tools: [read, bash, edit, write, grep, find, ls]
 mutating: true

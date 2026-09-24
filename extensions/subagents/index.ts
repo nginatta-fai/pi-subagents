@@ -8,6 +8,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { Message, Usage } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
 	getMarkdownTheme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -18,6 +20,8 @@ import {
 	discoverAgents,
 	formatAgentCatalog,
 } from "./agents.ts";
+import { createSubagentSelector } from "./selector.ts";
+import { loadSelection, restoreSelection, saveSelection, SELECTION_ENTRY_TYPE } from "./selection.ts";
 
 const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
 const MAX_STDERR_BYTES = 50 * 1024;
@@ -533,8 +537,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	const activeChildren = new Set<ChildProcess>();
 	const temporaryOutputs = new Set<string>();
 	let mutatingQueue: Promise<void> = Promise.resolve();
-	let toolRegistered = false;
 	let runtimeActive = true;
+	let disabledAgents = new Set<string>();
+	let toolDisabledBySelection = false;
+	const selectionPath = path.join(getAgentDir(), "subagents.json");
 
 	const enqueueMutating = <T,>(
 		operation: () => Promise<T>,
@@ -574,24 +580,46 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("subagents", {
-		description: "List configured subagents",
-		handler: async (_args, ctx) => {
+		description: "Enable/disable subagents interactively, or use /subagents list",
+		handler: async (args, ctx) => {
+			if (args.trim() && args.trim() !== "list") {
+				ctx.ui.notify("Usage: /subagents [list]", "warning");
+				return;
+			}
 			const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
-			const catalog = discovery.agents.length ? formatAgentCatalog(discovery.agents) : "No agents found.";
-			const diagnostics = discovery.diagnostics.length
-				? `\n\nConfiguration warnings:\n${discovery.diagnostics.map((item) => `- ${item}`).join("\n")}`
-				: "";
-			ctx.ui.notify(`${catalog}${diagnostics}`, discovery.diagnostics.length ? "warning" : "info");
+			if (discovery.diagnostics.length) {
+				ctx.ui.notify(`Configuration warnings:\n${discovery.diagnostics.join("\n")}`, "warning");
+			}
+			if (args.trim() === "list" || ctx.mode !== "tui" || !discovery.agents.length) {
+				const catalog = discovery.agents.map((agent) =>
+					`${disabledAgents.has(agent.name) ? "[disabled]" : "[enabled]"} ${formatAgentCatalog([agent])}`,
+				).join("\n");
+				ctx.ui.notify(catalog || "No agents found.", "info");
+				return;
+			}
+			await ctx.ui.custom<void>((tui, theme, keybindings, done) => createSubagentSelector({
+				agents: discovery.agents,
+				disabledAgents,
+				theme,
+				keybindings,
+				requestRender: () => tui.requestRender(),
+				onChange: (names) => {
+					pi.appendEntry(SELECTION_ENTRY_TYPE, { disabledAgents: names });
+					disabledAgents = new Set(names);
+					refreshTool(ctx);
+				},
+				onSave: (names) => saveSelection(selectionPath, { disabledAgents: names }),
+				onClose: () => done(undefined),
+			}));
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		if (toolRegistered) return;
-		toolRegistered = true;
-
+	function refreshTool(ctx: ExtensionContext) {
 		const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
-		const agentNames = discovery.agents.map((agent) => agent.name);
-		const catalog = discovery.agents.length ? formatAgentCatalog(discovery.agents) : "- No valid agents discovered";
+		const enabledAgents = discovery.agents.filter((agent) => !disabledAgents.has(agent.name));
+		const agentNames = enabledAgents.map((agent) => agent.name);
+		const hasWorker = agentNames.includes("worker");
+		const catalog = enabledAgents.length ? formatAgentCatalog(enabledAgents) : "- No enabled agents";
 		const agentSchema = StringEnum(agentNames.length ? agentNames : ["unavailable"], {
 			description: "Specialized agent to invoke",
 		});
@@ -601,19 +629,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			label: "Subagent",
 			description: [
 				"Delegate a self-contained task to one specialized agent running in an isolated Pi process and context window.",
-				"Routing policy: worker is the default executor for implementation, fixes, refactors, and other code changes; scout handles reconnaissance; reviewer handles independent review.",
-				"Choose the agent from this catalog:",
+				"Only enabled agents may be invoked. Choose the agent from this catalog:",
 				catalog,
 			].join("\n"),
-			promptSnippet: `Delegate specialized work to ${agentNames.join(", ") || "configured subagents"}; use worker by default for implementation and fixes`,
-			promptGuidelines: [
-				"Use subagent proactively when specialized investigation, independent review, or isolated implementation would materially improve the result; the user does not need to request delegation.",
-				"For any non-trivial request to implement, fix, address, apply, refactor, add, modify, or update code, call subagent with the worker agent before editing files yourself. This includes requests that refer to previous review findings by severity or item number.",
-				"The main agent should coordinate and verify worker output rather than duplicate the implementation. Implement directly only for a trivial one-line change or when the user explicitly asks not to use subagents.",
-				"Give subagent a self-contained task with the relevant goal, constraints, and expected output. When the user refers to earlier findings or items, copy their concrete details into the worker task because the subagent cannot see the parent conversation.",
-				"Use scout for broad codebase reconnaissance, reviewer for an independent quality/security/performance pass, and worker as the default executor for implementation and fixes.",
+			promptSnippet: `Delegate specialized work to ${agentNames.join(", ") || "enabled subagents"}${hasWorker ? "; use worker by default for implementation and fixes" : ""}`,
+			promptGuidelines: enabledAgents.length ? [
+				"Use enabled subagents proactively when specialized investigation, independent review, or isolated implementation would materially improve the result; the user does not need to request delegation.",
+				...(hasWorker ? [
+					"For any non-trivial request to implement, fix, address, apply, refactor, add, modify, or update code, call subagent with the worker agent before editing files yourself. This includes requests that refer to previous review findings by severity or item number.",
+					"The main agent should coordinate and verify worker output rather than duplicate the implementation. Implement directly only for a trivial one-line change or when the user explicitly asks not to use subagents.",
+				] : ["The worker agent is unavailable. Implement code changes directly rather than attempting to invoke it."]),
+				"Give subagent a self-contained task with the relevant goal, constraints, and expected output. When the user refers to earlier findings or items, copy their concrete details into the delegated task because the subagent cannot see the parent conversation.",
+				...(agentNames.includes("scout") ? ["Use scout for broad codebase reconnaissance."] : []),
+				...(agentNames.includes("reviewer") ? ["Use reviewer for an independent quality/security/performance pass."] : []),
 				"Do not invoke a mutating subagent in parallel with another subagent operating on the same working tree.",
-			],
+			] : [],
 			parameters: Type.Object({
 				agent: agentSchema,
 				task: Type.String({
@@ -624,10 +654,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			executionMode: "parallel",
 
 			async execute(_toolCallId, params, signal, onUpdate, executionCtx) {
+				const assertEnabled = () => {
+					if (disabledAgents.has(params.agent)) {
+						throw new Error(`Subagent "${params.agent}" is disabled. Enable it with /subagents.`);
+					}
+				};
+				assertEnabled();
 				const fresh = discoverAgents(executionCtx.cwd, executionCtx.isProjectTrusted());
 				const agent = fresh.agents.find((candidate) => candidate.name === params.agent);
 				if (!agent) {
-					const available = fresh.agents.map((candidate) => candidate.name).join(", ") || "none";
+					const available = fresh.agents.filter((candidate) => !disabledAgents.has(candidate.name)).map((candidate) => candidate.name).join(", ") || "none";
 					throw new Error(`Unknown subagent "${params.agent}". Available agents: ${available}`);
 				}
 
@@ -637,8 +673,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						: undefined,
 					thinking: executionCtx.thinkingLevel,
 				};
-				const run = () =>
-					runChildAgent(
+				const run = () => {
+					// Selection may change while a mutating invocation waits in the queue.
+					assertEnabled();
+					return runChildAgent(
 						agent,
 						params.task,
 						executionCtx.cwd,
@@ -648,6 +686,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						onUpdate,
 						activeChildren,
 					);
+				};
 				const childResult = await (agent.mutating ? enqueueMutating(run, signal) : run());
 				const lastAssistant = getLastAssistant(childResult.messages);
 				if (childResult.outputLimitError) {
@@ -760,13 +799,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			},
 		});
 
-		if (discovery.diagnostics.length && ctx.hasUI) {
-			ctx.ui.notify(
-				`Subagent configuration warnings:\n${discovery.diagnostics.join("\n")}`,
-				"warning",
-			);
+		// Do not disturb other tools or reactivate a tool disabled by another extension.
+		const activeTools = pi.getActiveTools();
+		if (!enabledAgents.length && activeTools.includes("subagent")) {
+			pi.setActiveTools(activeTools.filter((name) => name !== "subagent"));
+			toolDisabledBySelection = true;
+		} else if (enabledAgents.length && toolDisabledBySelection) {
+			pi.setActiveTools([...new Set([...activeTools, "subagent"])]);
+			toolDisabledBySelection = false;
 		}
+	}
+
+	function restoreState(ctx: ExtensionContext) {
+		const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
+		const warnings = [...discovery.diagnostics];
+		// Invalid configuration fails closed rather than unexpectedly enabling agents.
+		let defaults = { disabledAgents: discovery.agents.map((agent) => agent.name) };
+		try {
+			defaults = loadSelection(selectionPath);
+		} catch (error) {
+			warnings.push(error instanceof Error ? error.message : String(error));
+		}
+		try {
+			disabledAgents = new Set(restoreSelection(ctx.sessionManager.getBranch(), defaults).disabledAgents);
+		} catch (error) {
+			disabledAgents = new Set(discovery.agents.map((agent) => agent.name));
+			warnings.push(`Invalid session subagent selection: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		refreshTool(ctx);
+		if (warnings.length && ctx.hasUI) ctx.ui.notify(`Subagent configuration warnings:\n${warnings.join("\n")}`, "warning");
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		runtimeActive = true;
+		restoreState(ctx);
 	});
+	pi.on("session_tree", (_event, ctx) => restoreState(ctx));
 
 	pi.on("session_shutdown", async () => {
 		runtimeActive = false;
