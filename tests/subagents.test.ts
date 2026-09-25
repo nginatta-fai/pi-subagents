@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getEventListeners } from "node:events";
+import { createServer } from "node:http";
+import * as zlib from "node:zlib";
 import { test, type TestContext } from "node:test";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type Theme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
@@ -652,4 +654,343 @@ test("live preview timers are cleaned up after child abort and spawn failure", a
 	const spawnUpdateCount = spawnUpdates.length;
 	await new Promise((resolve) => setTimeout(resolve, 1_100));
 	assert.equal(spawnUpdates.length, spawnUpdateCount, "the elapsed-time timer must stop after spawn failure");
+});
+
+test("per-agent OpenAI fast mode reaches real child requests without leaking across agents", async (t) => {
+	const harness = extensionHarness(t);
+	const requests: Array<{ task: string; tier: unknown; temperature: unknown; leaked?: unknown; model: unknown; stream: unknown }> = [];
+	const counts = new Map<string, number>();
+	const taskNames = ["PRIORITY_AGENT", "PRIORITY_MISSING_TIER_AGENT", "PRIORITY_DEFAULT_RESPONSE_AGENT", "DEFAULT_AGENT", "OMITTED_AGENT", "OTHER_PROVIDER", "MULTI_TURN_AGENT", "PRIORITY_SAMPLING_DEFAULT", "DEFAULT_SAMPLING_PRIORITY", "OMITTED_SAMPLING_PRIORITY"];
+	const server = createServer(async (request, response) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(Buffer.from(chunk));
+		const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		const serialized = JSON.stringify(body);
+		const task = taskNames.find((name) => serialized.includes(name)) ?? "UNKNOWN_TASK";
+		requests.push({ task, tier: body.service_tier, temperature: body.temperature, leaked: body.discovered_extension_marker, model: body.model, stream: body.stream });
+		const requestNumber = (counts.get(task) ?? 0) + 1;
+		counts.set(task, requestNumber);
+		const events: object[] = [];
+		let output: Record<string, unknown>;
+		if (task === "MULTI_TURN_AGENT" && requestNumber === 1) {
+			const argumentsText = JSON.stringify({ path: path.join(harness.root, "fixture.txt") });
+			output = {
+				type: "function_call", id: "fc_read_1", call_id: "call_read_1",
+				name: "read", arguments: argumentsText,
+			};
+			events.push(
+				{ type: "response.output_item.added", output_index: 0, item: { ...output, arguments: "" } },
+				{ type: "response.function_call_arguments.delta", output_index: 0, delta: argumentsText },
+				{ type: "response.function_call_arguments.done", output_index: 0, arguments: argumentsText },
+				{ type: "response.output_item.done", output_index: 0, item: output },
+			);
+		} else {
+			output = {
+				type: "message", id: `msg_${task}_${requestNumber}`, role: "assistant",
+				content: [{ type: "output_text", text: `completed ${task}`, annotations: [] }],
+				status: "completed",
+			};
+			events.push(
+				{ type: "response.output_item.added", output_index: 0, item: { ...output, content: [] } },
+				{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: `completed ${task}` },
+				{ type: "response.output_item.done", output_index: 0, item: output },
+			);
+		}
+		events.push({
+			type: "response.completed",
+			response: {
+				id: `resp_${task}_${requestNumber}`,
+				status: "completed",
+				output: [output],
+				usage: {
+					input_tokens: 10,
+					output_tokens: 5,
+					total_tokens: 15,
+					input_tokens_details: { cached_tokens: 0 },
+					output_tokens_details: { reasoning_tokens: 0 },
+				},
+				...(task === "PRIORITY_MISSING_TIER_AGENT" ? {} : { service_tier: task === "PRIORITY_DEFAULT_RESPONSE_AGENT" ? "default" : body.service_tier ?? "default" }),
+			},
+		});
+		response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+		response.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n");
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	const address = server.address() as import("node:net").AddressInfo;
+	const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+	fs.mkdirSync(path.join(harness.agentDir, "agents"), { recursive: true });
+	fs.mkdirSync(path.join(harness.agentDir, "extensions"), { recursive: true });
+	fs.writeFileSync(path.join(harness.root, "fixture.txt"), "multi-turn fixture content");
+	const samplingModels = [
+		{ id: "fixture-model", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
+		{ id: "priority-sampling-default", name: "Priority sampling fixture", samplingParams: { service_tier: "default", temperature: 0.2 }, input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
+		{ id: "default-sampling-priority", name: "Default sampling fixture", samplingParams: { service_tier: "priority", temperature: 0.3 }, input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
+		{ id: "omitted-sampling-priority", name: "Omitted sampling fixture", samplingParams: { service_tier: "priority", temperature: 0.4 }, input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
+	].map((model) => ({ ...model, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } }));
+	fs.writeFileSync(path.join(harness.agentDir, "models.json"), JSON.stringify({ providers: {
+		openai: {
+			baseUrl, apiKey: "test-key", api: "openai-responses",
+			models: samplingModels,
+		},
+		other: {
+			baseUrl, apiKey: "test-key", api: "openai-responses",
+			models: [{ id: "fixture-model", name: "Other fixture", input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } }],
+		},
+	} }));
+	fs.writeFileSync(path.join(harness.agentDir, "extensions", "unwanted.ts"), `export default (pi) => pi.on("before_provider_request", (event) => ({ ...event.payload, discovered_extension_marker: true }));\n`);
+	const agent = (name: string, provider: string, fast: string | undefined, tools = "[]", model = "fixture-model") => {
+		fs.writeFileSync(path.join(harness.agentDir, "agents", `${name}.md`), [
+			"---", `name: ${name}`, `description: ${name} test agent`, `model: ${provider}/${model}`, `tools: ${tools}`,
+			...(fast === undefined ? [] : [`fast: ${fast}`]), "---", "Test integration agent.", "",
+		].join("\n"));
+	};
+	agent("priority-agent", "openai", "true");
+	agent("priority-missing-tier-agent", "openai", "true");
+	agent("priority-default-response-agent", "openai", "true");
+	agent("default-agent", "openai", "false");
+	agent("omitted-agent", "openai", undefined);
+	agent("other-provider", "other", "true");
+	agent("multi-turn-agent", "openai", "true", "[read]");
+	agent("priority-sampling-default", "openai", "true", "[]", "priority-sampling-default");
+	agent("default-sampling-priority", "openai", "false", "[]", "default-sampling-priority");
+	agent("omitted-sampling-priority", "openai", undefined, "[]", "omitted-sampling-priority");
+	fs.writeFileSync(path.join(harness.agentDir, "agents", "invalid-fast.md"), "---\nname: invalid-fast\ndescription: Invalid fast setting\nfast: yes\ntools: []\n---\nInvalid fixture.\n");
+
+	const originalScript = process.argv[1];
+	const previousTier = process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousOffline = process.env.PI_OFFLINE;
+	process.argv[1] = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+	process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = "priority";
+	process.env.PI_OFFLINE = "1";
+	delete process.env.PI_SUBAGENT_DEPTH;
+	t.after(() => {
+		process.argv[1] = originalScript;
+		if (previousTier === undefined) delete process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+		else process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = previousTier;
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+		else process.env.PI_OFFLINE = previousOffline;
+	});
+	await harness.emit("session_start");
+
+	const invoke = (name: string, task: string) => harness.tool.execute(
+		`fast-mode-${name}`, { agent: name, task }, undefined, undefined, harness.ctx,
+	);
+	const results = await Promise.all([
+		invoke("priority-agent", "PRIORITY_AGENT"),
+		invoke("priority-missing-tier-agent", "PRIORITY_MISSING_TIER_AGENT"),
+		invoke("priority-default-response-agent", "PRIORITY_DEFAULT_RESPONSE_AGENT"),
+		invoke("default-agent", "DEFAULT_AGENT"),
+		invoke("omitted-agent", "OMITTED_AGENT"),
+		invoke("other-provider", "OTHER_PROVIDER"),
+		invoke("multi-turn-agent", "MULTI_TURN_AGENT"),
+		invoke("priority-sampling-default", "PRIORITY_SAMPLING_DEFAULT"),
+		invoke("default-sampling-priority", "DEFAULT_SAMPLING_PRIORITY"),
+		invoke("omitted-sampling-priority", "OMITTED_SAMPLING_PRIORITY"),
+	]);
+	assert.deepEqual(results.map((result) => result.details.fast), [true, true, true, false, undefined, true, true, true, false, undefined]);
+	assert.ok(Math.abs(results[0].details.usage.cost.total - 0.00003) < 1e-9, "reported priority service tier should be reflected in usage pricing");
+	assert.ok(Math.abs(results[1].details.usage.cost.total - 0.00003) < 1e-9, "the requested tier should price usage when the response omits service_tier");
+	assert.ok(Math.abs(results[2].details.usage.cost.total - 0.000015) < 1e-9, "an explicit OpenAI response tier of default remains authoritative");
+	assert.equal(results[6].details.messages.length > 1, true, "the multi-turn agent should complete a tool round trip");
+	assert.equal(counts.get("MULTI_TURN_AGENT"), 2, "both model turns should reach the simulated endpoint");
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_AGENT").map((request) => request.tier), ["priority"]);
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_MISSING_TIER_AGENT").map((request) => request.tier), ["priority"]);
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_DEFAULT_RESPONSE_AGENT").map((request) => request.tier), ["priority"]);
+	assert.deepEqual(requests.filter((request) => request.task === "DEFAULT_AGENT").map((request) => request.tier), ["default"]);
+	assert.deepEqual(requests.filter((request) => request.task === "OMITTED_AGENT").map((request) => request.tier), [undefined]);
+	assert.deepEqual(requests.filter((request) => request.task === "OTHER_PROVIDER").map((request) => request.tier), [undefined]);
+	assert.deepEqual(requests.filter((request) => request.task === "MULTI_TURN_AGENT").map((request) => request.tier), ["priority", "priority"]);
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_SAMPLING_DEFAULT").map((request) => request.tier), ["priority"], "fast priority must override conflicting model samplingParams.service_tier");
+	assert.deepEqual(requests.filter((request) => request.task === "DEFAULT_SAMPLING_PRIORITY").map((request) => request.tier), ["default"], "fast default must override conflicting model samplingParams.service_tier");
+	assert.deepEqual(requests.filter((request) => request.task === "OMITTED_SAMPLING_PRIORITY").map((request) => request.tier), ["priority"], "without fast, existing model samplingParams.service_tier must be retained");
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_SAMPLING_DEFAULT").map((request) => request.temperature), [0.2], "other sampling parameters must survive tier override");
+	assert.deepEqual(requests.filter((request) => request.task === "DEFAULT_SAMPLING_PRIORITY").map((request) => request.temperature), [0.3], "other sampling parameters must survive tier override");
+	assert.ok(requests.every((request) => request.leaked === undefined), "--no-extensions must isolate discovered extensions while explicit helper loading remains active");
+	assert.ok(requests.every((request) => typeof request.model === "string" && request.stream === true), "the native provider wrapper must preserve unrelated request fields");
+	assert.equal(process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER, "priority", "child dispatch must not mutate the parent environment");
+	const resultPreview = harness.tool.renderResult!(results[0] as any, { expanded: false, isPartial: false }, theme, {} as any).render(120).join("\n");
+	assert.match(resultPreview, /fast: priority/);
+	await harness.command([], "list");
+	assert.match(harness.notifications.at(-1)!, /fast: priority/);
+	assert.match(harness.notifications.at(-1)!, /fast: default/);
+	assert.match(harness.notifications.at(-1)!, /fast: unchanged/);
+	assert.ok(harness.notifications.some((notification) => /fast must be true or false/.test(notification)));
+	assert.doesNotMatch(harness.tool.description, /invalid-fast/);
+});
+
+test("fast provider wrapping preserves a persisted remote-only OpenAI catalog model", async (t) => {
+	const harness = extensionHarness(t);
+	const requests: Array<Record<string, unknown>> = [];
+	const server = createServer(async (request, response) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(Buffer.from(chunk));
+		const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		requests.push(body);
+		const output = {
+			type: "message", id: "msg_cached_remote_model", role: "assistant",
+			content: [{ type: "output_text", text: "completed cached remote catalog model", annotations: [] }],
+			status: "completed",
+		};
+		const events = [
+			{ type: "response.output_item.added", output_index: 0, item: { ...output, content: [] } },
+			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: output.content[0].text },
+			{ type: "response.output_item.done", output_index: 0, item: output },
+			{ type: "response.completed", response: {
+				id: "resp_cached_remote_model", status: "completed", output: [output],
+				usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+				service_tier: "priority",
+			} },
+		];
+		response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+		response.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n");
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	const address = server.address() as import("node:net").AddressInfo;
+	const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+	fs.mkdirSync(path.join(harness.agentDir, "agents"), { recursive: true });
+	const cachedModel = {
+		id: "gpt6-cached-fixture", provider: "openai", name: "Persisted remote GPT 6 fixture",
+		api: "openai-responses", input: ["text"], reasoning: false, contextWindow: 24_000, maxTokens: 1_500,
+		cost: { input: 7, output: 11, cacheRead: 0, cacheWrite: 0 }, samplingParams: { temperature: 0.15 },
+	};
+	fs.writeFileSync(path.join(harness.agentDir, "models.json"), JSON.stringify({ providers: {
+		openai: { baseUrl, apiKey: "test-key", api: "openai-responses", models: [] },
+	} }));
+	fs.writeFileSync(path.join(harness.agentDir, "models-store.json"), JSON.stringify({ openai: {
+		models: [cachedModel], checkedAt: Date.now(), lastModified: Date.parse("2099-01-01T00:00:00.000Z"), etag: '"cached-gpt6-fixture"',
+	} }));
+	fs.writeFileSync(path.join(harness.agentDir, "agents", "cached-remote.md"), [
+		"---", "name: cached-remote", "description: Cached remote catalog integration fixture", "model: openai/gpt6-cached-fixture", "fast: true", "tools: []", "---", "Fixture.", "",
+	].join("\n"));
+
+	const originalScript = process.argv[1];
+	const previousTier = process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousOffline = process.env.PI_OFFLINE;
+	process.argv[1] = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+	process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = "priority";
+	process.env.PI_OFFLINE = "1";
+	delete process.env.PI_SUBAGENT_DEPTH;
+	t.after(() => {
+		process.argv[1] = originalScript;
+		if (previousTier === undefined) delete process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+		else process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = previousTier;
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+		else process.env.PI_OFFLINE = previousOffline;
+	});
+	await harness.emit("session_start");
+	const result = await harness.tool.execute("cached-remote-model", { agent: "cached-remote", task: "CACHED_REMOTE_GPT6_REQUEST" }, undefined, undefined, harness.ctx);
+	assert.equal(result.details.model, "openai/gpt6-cached-fixture");
+	assert.equal(requests.length, 1, "the model stored only in the persisted remote catalog must make a real child request");
+	assert.equal(requests[0].model, "gpt6-cached-fixture");
+	assert.equal(requests[0].service_tier, "priority");
+	assert.equal(requests[0].temperature, 0.15, "cached catalog sampling metadata must survive effective-provider wrapping");
+	assert.ok(Math.abs(result.details.usage.cost.total - 0.00025) < 1e-9, "cached catalog pricing metadata and the priority multiplier must reach real usage accounting");
+});
+
+test("native fast provider wrappers price Codex requests and cover automatic compaction", async (t) => {
+	const harness = extensionHarness(t);
+	const requests: Array<{ task: string; summary: boolean; tier: unknown; model: string }> = [];
+	const counts = new Map<string, number>();
+	const taskNames = ["CODEX_PRIORITY_TASK", "COMPACTION_PRIORITY_TASK"];
+	const server = createServer(async (request, response) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(Buffer.from(chunk));
+		const rawBody = Buffer.concat(chunks);
+		const decodedBody = request.headers["content-encoding"] === "zstd" ? zlib.zstdDecompressSync(rawBody) : rawBody;
+		const body = JSON.parse(decodedBody.toString("utf8"));
+		const serialized = JSON.stringify(body);
+		const task = taskNames.find((name) => serialized.includes(name)) ?? "UNKNOWN_TASK";
+		const summary = serialized.includes("context summarization assistant");
+		requests.push({ task, summary, tier: body.service_tier, model: body.model });
+		const key = `${task}:${summary}`;
+		const requestNumber = (counts.get(key) ?? 0) + 1;
+		counts.set(key, requestNumber);
+		const output = {
+			type: "message", id: `msg_${task}_${requestNumber}`, role: "assistant",
+			content: [{ type: "output_text", text: summary ? "## Goal\nContinue the task." : `completed ${task}`, annotations: [] }],
+			status: "completed",
+		};
+		const completed: Record<string, unknown> = {
+			id: `resp_${task}_${requestNumber}`, status: "completed", output: [output],
+			usage: {
+				input_tokens: task === "COMPACTION_PRIORITY_TASK" && !summary ? 900 : 10,
+				output_tokens: 5, total_tokens: task === "COMPACTION_PRIORITY_TASK" && !summary ? 905 : 15,
+				input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 },
+			},
+		};
+		if (task === "CODEX_PRIORITY_TASK") completed.service_tier = "default";
+		const events = [
+			{ type: "response.output_item.added", output_index: 0, item: { ...output, content: [] } },
+			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: output.content[0].text },
+			{ type: "response.output_item.done", output_index: 0, item: output },
+			{ type: "response.completed", response: completed },
+		];
+		response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+		response.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n");
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	const address = server.address() as import("node:net").AddressInfo;
+	const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+	fs.mkdirSync(path.join(harness.agentDir, "agents"), { recursive: true });
+	fs.mkdirSync(path.join(harness.agentDir, "extensions"), { recursive: true });
+	const cost = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 };
+	fs.writeFileSync(path.join(harness.agentDir, "models.json"), JSON.stringify({ providers: {
+		"openai-codex": {
+			baseUrl, models: [{ id: "fixture-codex-model", name: "Codex fixture", api: "openai-codex-responses", input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000, cost }],
+		},
+		openai: {
+			baseUrl, apiKey: "test-key", api: "openai-responses",
+			models: [{ id: "fixture-compact-model", name: "Compaction fixture", input: ["text"], reasoning: false, contextWindow: 1_024, maxTokens: 512, cost }],
+		},
+	} }));
+	const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+	const accessToken = `${encode({ alg: "none" })}.${encode({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })}.signature`;
+	fs.writeFileSync(path.join(harness.agentDir, "auth.json"), JSON.stringify({ "openai-codex": {
+		type: "oauth", access: accessToken, refresh: "fixture-refresh", expires: Date.now() + 3_600_000, accountId: "fixture-account",
+	} }));
+	// Keep Codex on the fixture's SSE path; its native adapter may zstd-compress the HTTP body.
+	fs.writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ transport: "sse", compaction: { reserveTokens: 128, keepRecentTokens: 1 } }));
+	const agent = (name: string, model: string) => fs.writeFileSync(path.join(harness.agentDir, "agents", `${name}.md`), [
+		"---", `name: ${name}`, `description: ${name} integration fixture`, `model: ${model}`, "fast: true", "tools: []", "---", "Fixture.", "",
+	].join("\n"));
+	agent("codex-priority", "openai-codex/fixture-codex-model");
+	agent("compaction-priority", "openai/fixture-compact-model");
+
+	const originalScript = process.argv[1];
+	const previousTier = process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+	const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+	const previousOffline = process.env.PI_OFFLINE;
+	process.argv[1] = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+	process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = "priority";
+	process.env.PI_OFFLINE = "1";
+	delete process.env.PI_SUBAGENT_DEPTH;
+	t.after(() => {
+		process.argv[1] = originalScript;
+		if (previousTier === undefined) delete process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+		else process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = previousTier;
+		if (previousDepth === undefined) delete process.env.PI_SUBAGENT_DEPTH;
+		else process.env.PI_SUBAGENT_DEPTH = previousDepth;
+		if (previousOffline === undefined) delete process.env.PI_OFFLINE;
+		else process.env.PI_OFFLINE = previousOffline;
+	});
+	await harness.emit("session_start");
+	const [codexResult, compactionResult] = await Promise.all([
+		harness.tool.execute("codex-priority", { agent: "codex-priority", task: "CODEX_PRIORITY_TASK" }, undefined, undefined, harness.ctx),
+		harness.tool.execute("compaction-priority", { agent: "compaction-priority", task: "COMPACTION_PRIORITY_TASK" }, undefined, undefined, harness.ctx),
+	]);
+	assert.ok(requests.some((request) => request.task === "CODEX_PRIORITY_TASK" && request.tier === "priority"), "Codex request should request priority");
+	assert.ok(requests.some((request) => request.task === "COMPACTION_PRIORITY_TASK" && !request.summary), "the OpenAI agent should make its initial request");
+	assert.ok(requests.some((request) => request.task === "COMPACTION_PRIORITY_TASK" && request.summary), "the small context window should trigger real automatic compaction");
+	assert.ok(requests.filter((request) => request.task === "COMPACTION_PRIORITY_TASK").every((request) => request.tier === "priority"), "the compaction summary request should retain the child's priority tier");
+	assert.ok(Math.abs(codexResult.details.usage.cost.total - 0.00003) < 1e-9, "Codex should account priority when its response reports default");
+	assert.equal(compactionResult.details.fast, true);
 });

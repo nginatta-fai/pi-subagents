@@ -3,6 +3,7 @@ name: reviewer
 description: Independent, read-only review for correctness, security, regressions, and maintainability
 model: openai-codex/gpt-6-sol
 thinking: xhigh
+fast: false
 tools: [read, grep, find]
 mutating: false
 ---

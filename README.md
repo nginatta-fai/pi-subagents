@@ -4,11 +4,11 @@ An installable Pi package that lets the main agent autonomously delegate work to
 
 ## Included agents
 
-| Agent | Role | Model | Thinking | Tools |
-|---|---|---|---|---|
-| `scout` | Fast codebase reconnaissance | `openai-codex/gpt-6-luna` | `low` | `read`, `grep`, `find`, `ls` |
-| `reviewer` | Independent correctness, security, and performance review | `openai-codex/gpt-6-sol` | `xhigh` | `read`, `grep`, `find` |
-| `worker` | Simple, high-performance autonomous implementation | `openai-codex/gpt-6-luna` | `xhigh` | all coding and search tools |
+| Agent | Role | Model | Thinking | Service tier | Tools |
+|---|---|---|---|---|---|
+| `scout` | Fast codebase reconnaissance | `openai-codex/gpt-6-luna` | `low` | Priority | `read`, `grep`, `find`, `ls` |
+| `reviewer` | Independent correctness, security, and performance review | `openai-codex/gpt-6-sol` | `xhigh` | Standard | `read`, `grep`, `find` |
+| `worker` | Simple, high-performance autonomous implementation | `openai-codex/gpt-6-luna` | `xhigh` | Priority | all coding and search tools |
 
 The target machine must have authentication and model access configured for these models. You can override any bundled agent without modifying the package; see [Agent overrides](#agent-overrides).
 
@@ -19,19 +19,19 @@ The target machine must have authentication and model access configured for thes
 Push this repository to a Git host, tag a release, and install it globally:
 
 ```bash
-pi install git:github.com/nginatta-fai/pi-subagents@0.2.1
+pi install git:github.com/nginatta-fai/pi-subagents@0.3.0
 ```
 
 A raw Git URL also works:
 
 ```bash
-pi install https://github.com/nginatta-fai/pi-subagents@0.2.1
+pi install https://github.com/nginatta-fai/pi-subagents@0.3.0
 ```
 
 Use `-l` to record the package in the current project's `.pi/settings.json` instead of global settings:
 
 ```bash
-pi install git:github.com/nginatta-fai/pi-subagents@0.2.1 -l
+pi install git:github.com/nginatta-fai/pi-subagents@0.3.0 -l
 ```
 
 After changing installed resources, start a new Pi session or run `/reload`.
@@ -53,7 +53,7 @@ pi --no-extensions -e ./extensions/subagents/index.ts
 After publishing the package:
 
 ```bash
-pi install npm:pi-subagents@0.2.1
+pi install npm:pi-subagents@0.3.0
 ```
 
 Inspect and manage installations with:
@@ -76,6 +76,7 @@ Each invocation starts a separate ephemeral Pi process with:
 - an exact tool allowlist
 - the Markdown body of its agent file appended as its role prompt
 - no discovered extensions, skills, or prompt templates
+- an optional child-only OpenAI service-tier override when `fast` is configured
 - no persisted child session
 - JSON event streaming back to the parent tool UI
 
@@ -133,6 +134,7 @@ pi-subagents/
     └── subagents/
         ├── index.ts
         ├── agents.ts
+        ├── openai-tier.ts
         ├── selection.ts
         ├── selector.ts
         └── agents/
@@ -176,6 +178,7 @@ name: example
 description: Short routing description shown to the main model
 model: provider/model-id
 thinking: medium
+fast: true
 tools: [read, grep, find, ls]
 mutating: false
 ---
@@ -185,6 +188,9 @@ The role-specific system prompt goes here.
 
 - Omitting `model` or `thinking` inherits the parent session's current value.
 - Omitting `tools` uses Pi's defaults; `tools: []` enables no tools.
+- `fast: true` requests OpenAI `service_tier: "priority"`; `fast: false` explicitly requests `service_tier: "default"`. An explicit `fast` setting takes precedence over a conflicting model `samplingParams.service_tier` while preserving other sampling parameters. Omitting `fast` adds no fast-mode override and leaves model sampling parameters unchanged. This setting is independent of the parent session's `/fast` mode.
+- Fast mode applies only to requests dispatched through `openai`/`openai-responses` or `openai-codex`/`openai-codex-responses`, including compatible endpoints registered under those provider IDs. It also covers Pi's built-in compaction and summarization requests when they use one of those model/API pairs. If a separate compaction model is used, that model's provider and API determine whether the tier applies; other providers, APIs, and models are unchanged. A thin child-only wrapper is applied to Pi's effective runtime providers after startup model selection, retaining persisted and refreshed catalogs, auth, models.json configuration, request handling, and usage accounting. The helper is explicitly loaded only in configured children, and child `--no-extensions` isolation remains in place.
+- Priority availability depends on provider, model, account eligibility, and endpoint support. Priority may cost more or consume a different quota; requesting it does not guarantee the provider will accept or honor it. Pi's native OpenAI Responses accounting uses the response's `service_tier`, falling back to the requested tier only when the response omits it; an explicit response tier of `default` is accounted as default. Native Codex accounting treats response `default` as the requested `priority`/`flex` tier when applicable, and falls back to the request tier when the response omits one. Both use Pi's model-specific multipliers and configured model costs, so usage estimates may differ from the endpoint's actual billing.
 - Agents with `mutating: true` are queued so two writers do not run simultaneously.
 - Agents with `bash`, `powershell`, `edit`, or `write` are always treated as mutating, even if their frontmatter says otherwise.
 - Child Pi processes use `--no-extensions`, preventing recursive delegation and inherited extension loading.
@@ -199,4 +205,4 @@ npm run check
 npm test
 ```
 
-Tests cover the picker, saved and branch-local selections, dynamic tool routing, and dispatch guards without making model requests.
+Tests cover the picker, saved and branch-local selections, dynamic tool routing, dispatch guards, and fast-mode child processes against local simulated OpenAI Responses and Codex endpoints, including automatic compaction. They do not make paid network requests.

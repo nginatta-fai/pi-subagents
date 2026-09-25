@@ -16,6 +16,7 @@ export interface AgentConfig {
 	model?: string;
 	thinking?: ThinkingLevel;
 	tools?: string[];
+	fast?: boolean;
 	mutating: boolean;
 	systemPrompt: string;
 	source: AgentSource;
@@ -36,6 +37,7 @@ type AgentFrontmatter = {
 	model?: unknown;
 	thinking?: unknown;
 	tools?: unknown;
+	fast?: unknown;
 	mutating?: unknown;
 };
 
@@ -135,6 +137,10 @@ function loadAgentsFromDir(
 				diagnostics.push(`${filePath}: thinking must be off, minimal, low, medium, high, xhigh, or max`);
 				continue;
 			}
+			if (frontmatter.fast !== undefined && typeof frontmatter.fast !== "boolean") {
+				diagnostics.push(`${filePath}: fast must be true or false`);
+				continue;
+			}
 			if (frontmatter.mutating !== undefined && typeof frontmatter.mutating !== "boolean") {
 				diagnostics.push(`${filePath}: mutating must be true or false`);
 				continue;
@@ -172,6 +178,7 @@ function loadAgentsFromDir(
 						: undefined,
 				thinking: frontmatter.thinking as ThinkingLevel | undefined,
 				tools: parsedTools.tools,
+				fast: frontmatter.fast as boolean | undefined,
 				mutating: hasMutationCapableTools || frontmatter.mutating === true,
 				systemPrompt: body.trim(),
 				source,
@@ -225,7 +232,8 @@ export function formatAgentCatalog(agents: AgentConfig[]): string {
 					: agent.tools.length === 0
 						? "none"
 						: agent.tools.join(", ");
-			return `- ${agent.name}: ${agent.description} [model: ${model}; thinking: ${thinking}; tools: ${tools}; ${agent.mutating ? "may mutate files" : "read-only"}]`;
+			const fast = agent.fast === undefined ? "unchanged" : agent.fast ? "priority" : "default";
+			return `- ${agent.name}: ${agent.description} [model: ${model}; thinking: ${thinking}; fast: ${fast}; tools: ${tools}; ${agent.mutating ? "may mutate files" : "read-only"}]`;
 		})
 		.join("\n");
 }

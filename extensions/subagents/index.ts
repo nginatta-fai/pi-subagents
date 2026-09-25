@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { Message, Usage } from "@earendil-works/pi-ai";
@@ -24,6 +25,8 @@ import { createSubagentSelector } from "./selector.ts";
 import { loadSelection, restoreSelection, saveSelection, SELECTION_ENTRY_TYPE } from "./selection.ts";
 
 const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
+const OPENAI_TIER_EXTENSION = path.join(path.dirname(fileURLToPath(import.meta.url)), "openai-tier.ts");
+const OPENAI_TIER_ENV = "PI_SUBAGENTS_OPENAI_SERVICE_TIER";
 const MAX_STDERR_BYTES = 50 * 1024;
 const MAX_TIMELINE_ITEMS = 100;
 const MAX_TIMELINE_ITEM_BYTES = 8 * 1024;
@@ -74,6 +77,7 @@ interface SubagentDetails {
 	model: string;
 	thinking: ThinkingLevel;
 	tools: string[] | null;
+	fast?: boolean;
 	mutating: boolean;
 	startedAt?: number;
 	queuedAt?: number;
@@ -371,6 +375,7 @@ async function runChildAgent(
 		if (agent.tools.length === 0) args.push("--no-tools");
 		else args.push("--tools", agent.tools.join(","));
 	}
+	if (agent.fast !== undefined) args.push("--extension", OPENAI_TIER_EXTENSION);
 	args.push("--append-system-prompt", prompt.filePath, "--", `Task: ${task}`);
 
 	const messages: Message[] = [];
@@ -400,6 +405,7 @@ async function runChildAgent(
 		model,
 		thinking,
 		tools: agent.tools ?? null,
+		fast: agent.fast,
 		mutating: agent.mutating,
 		startedAt,
 		durationMs: Date.now() - startedAt,
@@ -436,14 +442,17 @@ async function runChildAgent(
 	try {
 		emitUpdate(true);
 		const invocation = getPiInvocation(args);
+		const childEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			PI_SUBAGENT_DEPTH: String(depth + 1),
+			PI_SUBAGENT_PARENT_SESSION_ID: process.env.PI_SESSION_ID ?? "",
+		};
+		if (agent.fast === undefined) delete childEnv[OPENAI_TIER_ENV];
+		else childEnv[OPENAI_TIER_ENV] = agent.fast ? "priority" : "default";
 		const child = spawn(invocation.command, invocation.args, {
 			cwd,
 			detached: process.platform !== "win32",
-			env: {
-				...process.env,
-				PI_SUBAGENT_DEPTH: String(depth + 1),
-				PI_SUBAGENT_PARENT_SESSION_ID: process.env.PI_SESSION_ID ?? "",
-			},
+			env: childEnv,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
@@ -926,6 +935,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							model: agent.model ?? defaults.model ?? "unconfigured",
 							thinking: agent.thinking ?? defaults.thinking ?? "off",
 							tools: agent.tools ?? null,
+							fast: agent.fast,
 							mutating: agent.mutating,
 							queuedAt,
 							queuedDurationMs: elapsedMs,
@@ -972,6 +982,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					model: childResult.model,
 					thinking: childResult.thinking,
 					tools: agent.tools ?? null,
+					fast: agent.fast,
 					mutating: agent.mutating,
 					startedAt: childResult.startedAt,
 					queuedDurationMs: childResult.queuedDurationMs,
@@ -1010,7 +1021,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const icon = running ? theme.fg("warning", "⏳") : theme.fg("success", "✓");
 				const duration = details.durationMs === undefined ? "" : ` · ${(details.durationMs / 1_000).toFixed(1)}s child`;
 				const queuedDuration = details.queuedDurationMs === undefined ? "" : ` · ${(details.queuedDurationMs / 1_000).toFixed(1)}s queued`;
-				const header = `${icon} ${theme.fg("accent", theme.bold(details.agent))} ${theme.fg("muted", `${details.model}:${details.thinking}${queuedDuration}${duration}`)}`;
+				const fast = details.fast === undefined ? "unchanged" : details.fast ? "priority" : "default";
+				const header = `${icon} ${theme.fg("accent", theme.bold(details.agent))} ${theme.fg("muted", `${details.model}:${details.thinking} · fast: ${fast}${queuedDuration}${duration}`)}`;
 
 				if (running) {
 					const activeTools = details.activeTools ?? [];

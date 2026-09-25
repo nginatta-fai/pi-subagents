@@ -25,13 +25,13 @@ export function createSubagentSelector(options: SelectorOptions) {
 	const key = (action: Parameters<KeybindingsManager["getKeys"]>[0]) => kb.getKeys(action).join("/") || "unbound";
 	const refresh = (selectedName = list?.getSelectedItem()?.value) => {
 		filtered = fuzzyFilter(agents, search.getValue(), (agent) =>
-			`${agent.name} ${agent.description} ${agent.model ?? ""}`,
+			`${agent.name} ${agent.description} ${agent.model ?? ""} ${agent.fast === undefined ? "unchanged" : agent.fast ? "priority" : "default"}`,
 		);
 		list = new SelectList(
 			filtered.map((agent) => ({
 				value: agent.name,
 				label: `${disabled.has(agent.name) ? "[ ]" : "[x]"} ${agent.name}`,
-				description: `${agent.model ?? "inherit model"} · ${agent.thinking ?? "inherit thinking"}`,
+				description: `${agent.model ?? "inherit model"} · ${agent.thinking ?? "inherit thinking"} · fast ${agent.fast === undefined ? "unchanged" : agent.fast ? "priority" : "default"}`,
 			})),
 			8,
 			{
