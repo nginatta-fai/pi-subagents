@@ -27,7 +27,8 @@ const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
 const MAX_STDERR_BYTES = 50 * 1024;
 const MAX_TIMELINE_ITEMS = 100;
 const MAX_TIMELINE_ITEM_BYTES = 8 * 1024;
-const MAX_LIVE_TEXT_BYTES = 128 * 1024;
+const MAX_LIVE_TEXT_BYTES = 16 * 1024;
+const MAX_LIVE_TOOL_TEXT_BYTES = 8 * 1024;
 const MAX_JSON_EVENT_BYTES = 5 * 1024 * 1024;
 const MAX_CAPTURED_MESSAGE_BYTES = 10 * 1024 * 1024;
 const MAX_SUBAGENT_DEPTH = 1;
@@ -49,6 +50,21 @@ interface TimelineItem {
 	text: string;
 }
 
+type LiveStatus =
+	| "starting"
+	| "queued"
+	| "waiting for model"
+	| "retrying / backoff"
+	| "retrying"
+	| "compacting"
+	| "summarizing"
+	| "thinking"
+	| "responding"
+	| "planning tools"
+	| "running tools"
+	| "continuing"
+	| "finishing";
+
 interface SubagentDetails {
 	status: "running" | "completed";
 	agent: string;
@@ -59,8 +75,15 @@ interface SubagentDetails {
 	thinking: ThinkingLevel;
 	tools: string[] | null;
 	mutating: boolean;
-	startedAt: number;
+	startedAt?: number;
+	queuedAt?: number;
+	queuedDurationMs?: number;
 	durationMs?: number;
+	liveStatus?: LiveStatus;
+	liveToolProgress?: { toolCallId: string; activity: string; text: string };
+	liveText?: string;
+	liveActivity?: string;
+	activeTools?: string[];
 	messages: Message[];
 	timeline: TimelineItem[];
 	usage: Usage;
@@ -80,6 +103,7 @@ interface ChildResult {
 	startedAt: number;
 	durationMs: number;
 	outputLimitError?: string;
+	queuedDurationMs?: number;
 }
 
 type UpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
@@ -211,6 +235,18 @@ function truncateUtf8Tail(text: string, maxBytes: number): string {
 	return truncated;
 }
 
+function formatLiveLabel(label: string): string {
+	return truncateUtf8Head(label.replace(/\s+/g, " ").trim(), 160);
+}
+
+function truncateLiveExcerpt(text: string, maxBytes: number, maxLines: number): string {
+	return truncateUtf8Tail(text, maxBytes)
+		.split(/\r\n|\r|\n/)
+		.slice(-maxLines)
+		.join("\n")
+		.trimStart();
+}
+
 function pushTimeline(timeline: TimelineItem[], item: TimelineItem): void {
 	const boundedText = truncateUtf8Head(item.text, MAX_TIMELINE_ITEM_BYTES);
 	timeline.push({
@@ -306,6 +342,7 @@ async function runChildAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: UpdateCallback | undefined,
 	activeChildren: Set<ChildProcess>,
+	queuedDurationMs?: number,
 ): Promise<ChildResult> {
 	if (signal?.aborted) throw new Error(`Subagent "${agent.name}" was aborted before it started`);
 
@@ -342,8 +379,16 @@ async function runChildAgent(
 	const startedAt = Date.now();
 	let stderr = "";
 	let liveText = "";
-	let statusText = "starting";
+	let statusText: LiveStatus = "starting";
+	let liveActivity = "";
+	const activeTools = new Map<string, string>();
+	const activeToolProgress = new Map<string, string>();
+	let latestProgressToolId: string | undefined;
+	let summarizationRetrySource: "compaction" | "branchSummary" | undefined;
 	let lastUpdateAt = 0;
+	let statusTimer: ReturnType<typeof setInterval> | undefined;
+	let childProcess: ChildProcess | undefined;
+	let abortHandler: (() => void) | undefined;
 	let aborted = false;
 
 	const makeDetails = (status: "running" | "completed"): SubagentDetails => ({
@@ -357,9 +402,21 @@ async function runChildAgent(
 		tools: agent.tools ?? null,
 		mutating: agent.mutating,
 		startedAt,
-		durationMs: status === "completed" ? Date.now() - startedAt : undefined,
-		messages: [...messages],
-		timeline: [...timeline],
+		durationMs: Date.now() - startedAt,
+		queuedDurationMs,
+		liveStatus: status === "running" ? statusText : undefined,
+		liveText: status === "running" ? liveText : undefined,
+		liveActivity: status === "running" ? liveActivity : undefined,
+		liveToolProgress: status === "running" && latestProgressToolId && activeTools.has(latestProgressToolId)
+			? {
+				toolCallId: latestProgressToolId,
+				activity: activeTools.get(latestProgressToolId)!,
+				text: activeToolProgress.get(latestProgressToolId) ?? "",
+			}
+			: undefined,
+		activeTools: status === "running" ? [...activeTools.values()] : undefined,
+		messages: status === "running" ? [] : [...messages],
+		timeline: status === "running" ? [] : [...timeline],
 		usage: { ...usage, cost: { ...usage.cost } },
 		stderr,
 	});
@@ -377,6 +434,7 @@ async function runChildAgent(
 	};
 
 	try {
+		emitUpdate(true);
 		const invocation = getPiInvocation(args);
 		const child = spawn(invocation.command, invocation.args, {
 			cwd,
@@ -389,7 +447,12 @@ async function runChildAgent(
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		childProcess = child;
 		activeChildren.add(child);
+		if (onUpdate) {
+			statusTimer = setInterval(() => emitUpdate(true), 1_000);
+			statusTimer.unref();
+		}
 
 		let stdoutBuffer = "";
 		let settled = false;
@@ -416,21 +479,60 @@ async function runChildAgent(
 				return;
 			}
 
+			if (event.type === "agent_start") {
+				statusText = "waiting for model";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "turn_start") {
+				statusText = "waiting for model";
+				liveText = "";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "message_start") {
+				if (event.message?.role === "assistant") {
+					statusText = "waiting for model";
+					liveText = "";
+					emitUpdate();
+				}
+				return;
+			}
+
 			if (event.type === "message_update") {
 				const assistantEvent = event.assistantMessageEvent;
-				if (assistantEvent?.type === "text_delta" && typeof assistantEvent.delta === "string") {
+				if (assistantEvent?.type === "thinking_start" || assistantEvent?.type === "thinking_delta") {
+					statusText = "thinking";
+					emitUpdate();
+				} else if (assistantEvent?.type === "text_start") {
+					statusText = "responding";
+					emitUpdate();
+				} else if (assistantEvent?.type === "text_delta" && typeof assistantEvent.delta === "string") {
 					liveText += assistantEvent.delta;
 					if (Buffer.byteLength(liveText, "utf8") > MAX_LIVE_TEXT_BYTES) {
-						liveText = `[earlier live output omitted]\n${truncateUtf8Tail(liveText, MAX_LIVE_TEXT_BYTES)}`;
+						const marker = "[earlier live output omitted]\n";
+						liveText = marker + truncateUtf8Tail(liveText, MAX_LIVE_TEXT_BYTES - Buffer.byteLength(marker, "utf8"));
 					}
 					statusText = "responding";
+					emitUpdate();
+				} else if (assistantEvent?.type === "thinking_end") {
+					statusText = "waiting for model";
+					emitUpdate();
+				} else if (
+					assistantEvent?.type === "toolcall_start" ||
+					assistantEvent?.type === "toolcall_delta" ||
+					assistantEvent?.type === "toolcall_end"
+				) {
+					statusText = "planning tools";
 					emitUpdate();
 				}
 				return;
 			}
 
 			if (event.type === "tool_execution_start") {
-				if (typeof event.toolName !== "string") {
+				if (typeof event.toolName !== "string" || typeof event.toolCallId !== "string") {
 					failForOutputLimit("Subagent emitted an invalid tool execution event");
 					return;
 				}
@@ -439,8 +541,102 @@ async function runChildAgent(
 					MAX_TIMELINE_ITEM_BYTES,
 				);
 				pushTimeline(timeline, { type: "tool", text: description });
-				statusText = description;
+				activeTools.set(event.toolCallId, description);
+				liveActivity = description;
+				statusText = "running tools";
 				liveText = "";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "tool_execution_update") {
+				if (typeof event.toolCallId !== "string" || !activeTools.has(event.toolCallId)) return;
+				const content = event.partialResult?.content;
+				if (!Array.isArray(content)) return;
+				let snapshot = "";
+				for (const part of content) {
+					if (part?.type !== "text" || typeof part.text !== "string") continue;
+					snapshot = truncateUtf8Tail(
+						snapshot + truncateUtf8Tail(part.text, MAX_LIVE_TOOL_TEXT_BYTES),
+						MAX_LIVE_TOOL_TEXT_BYTES,
+					);
+				}
+				activeToolProgress.set(event.toolCallId, snapshot);
+				latestProgressToolId = event.toolCallId;
+				statusText = "running tools";
+				emitUpdate();
+				return;
+			}
+
+			if (event.type === "tool_execution_end") {
+				if (typeof event.toolCallId !== "string") {
+					failForOutputLimit("Subagent emitted an invalid tool execution event");
+					return;
+				}
+				activeTools.delete(event.toolCallId);
+				activeToolProgress.delete(event.toolCallId);
+				if (latestProgressToolId === event.toolCallId) {
+					latestProgressToolId = undefined;
+					for (const toolCallId of activeToolProgress.keys()) latestProgressToolId = toolCallId;
+				}
+				statusText = activeTools.size ? "running tools" : "continuing";
+				liveText = "";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "turn_end") {
+				statusText = event.toolResults?.length ? "continuing" : "waiting for model";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "agent_end") {
+				statusText = event.willRetry ? "retrying / backoff" : "finishing";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "auto_retry_start" || event.type === "summarization_retry_scheduled") {
+				statusText = "retrying / backoff";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "auto_retry_end") {
+				if (!event.success) statusText = "finishing";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "summarization_retry_attempt_start") {
+				summarizationRetrySource = event.source;
+				statusText = event.source === "compaction" ? "compacting" : "summarizing";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "summarization_retry_finished") {
+				statusText = summarizationRetrySource === "compaction" ? "compacting" : "waiting for model";
+				summarizationRetrySource = undefined;
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "compaction_start") {
+				statusText = "compacting";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "compaction_end") {
+				statusText = event.willRetry ? "retrying" : "finishing";
+				emitUpdate(true);
+				return;
+			}
+
+			if (event.type === "agent_settled") {
+				statusText = "finishing";
 				emitUpdate(true);
 				return;
 			}
@@ -465,7 +661,7 @@ async function runChildAgent(
 					const text = assistantText(message);
 					if (text) pushTimeline(timeline, { type: "text", text });
 					liveText = "";
-					statusText = message.stopReason === "toolUse" ? "using tools" : "finishing";
+					statusText = message.stopReason === "toolUse" ? "planning tools" : "finishing";
 				}
 				emitUpdate(true);
 			}
@@ -489,7 +685,7 @@ async function runChildAgent(
 			stderr = appendBoundedTail(stderr, text, MAX_STDERR_BYTES);
 		});
 
-		const abortHandler = () => {
+		abortHandler = () => {
 			aborted = true;
 			terminateProcess(child);
 		};
@@ -509,8 +705,6 @@ async function runChildAgent(
 			child.on("close", (code) => finish(code ?? 1));
 		});
 
-		signal?.removeEventListener("abort", abortHandler);
-		activeChildren.delete(child);
 		if (stdoutBuffer.trim()) processLine(stdoutBuffer);
 		if (spawnError) stderr = appendBoundedTail(stderr, spawnError.message, MAX_STDERR_BYTES);
 		if (outputLimitError) stderr = appendBoundedTail(stderr, outputLimitError, MAX_STDERR_BYTES);
@@ -527,8 +721,14 @@ async function runChildAgent(
 			startedAt,
 			durationMs: Date.now() - startedAt,
 			outputLimitError,
+			queuedDurationMs,
 		};
 	} finally {
+		if (statusTimer) clearInterval(statusTimer);
+		if (childProcess) {
+			if (abortHandler) signal?.removeEventListener("abort", abortHandler);
+			activeChildren.delete(childProcess);
+		}
 		await fs.promises.rm(prompt.directory, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
@@ -537,19 +737,43 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	const activeChildren = new Set<ChildProcess>();
 	const temporaryOutputs = new Set<string>();
 	let mutatingQueue: Promise<void> = Promise.resolve();
+	let mutatingQueued = 0;
+	let mutatingRunning = false;
 	let runtimeActive = true;
 	let disabledAgents = new Set<string>();
 	let toolDisabledBySelection = false;
 	const selectionPath = path.join(getAgentDir(), "subagents.json");
 
 	const enqueueMutating = <T,>(
-		operation: () => Promise<T>,
+		operation: (queuedDurationMs?: number) => Promise<T>,
 		signal: AbortSignal | undefined,
+		onQueued?: (elapsedMs: number, queuedAt: number) => void,
 	): Promise<T> => {
-		const queued = mutatingQueue.then(() => {
+		const queuedAt = Date.now();
+		const wasQueued = mutatingRunning || mutatingQueued > 0;
+		mutatingQueued++;
+		let queueTimer: ReturnType<typeof setInterval> | undefined;
+		const stopQueueUpdates = () => {
+			if (queueTimer) clearInterval(queueTimer);
+			queueTimer = undefined;
+		};
+		if (wasQueued && !signal?.aborted && onQueued) {
+			const report = () => onQueued(Date.now() - queuedAt, queuedAt);
+			report();
+			queueTimer = setInterval(report, 1_000);
+			queueTimer.unref();
+		}
+		const queued = mutatingQueue.then(async () => {
+			stopQueueUpdates();
+			mutatingQueued--;
 			if (!runtimeActive) throw new Error("Subagent runtime is shutting down");
 			if (signal?.aborted) throw new Error("Subagent was aborted while waiting for the writer queue");
-			return operation();
+			mutatingRunning = true;
+			try {
+				return await operation(wasQueued ? Date.now() - queuedAt : undefined);
+			} finally {
+				mutatingRunning = false;
+			}
 		});
 		mutatingQueue = queued.then(
 			() => undefined,
@@ -565,8 +789,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				signal.removeEventListener("abort", abortHandler);
 				callback();
 			};
-			const abortHandler = () =>
+			const abortHandler = () => {
+				stopQueueUpdates();
 				finish(() => reject(new Error("Subagent was aborted while waiting for the writer queue")));
+			};
 			if (signal.aborted) {
 				abortHandler();
 				return;
@@ -673,7 +899,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						: undefined,
 					thinking: executionCtx.thinkingLevel,
 				};
-				const run = () => {
+				const run = (queuedDurationMs?: number) => {
 					// Selection may change while a mutating invocation waits in the queue.
 					assertEnabled();
 					return runChildAgent(
@@ -685,9 +911,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						signal,
 						onUpdate,
 						activeChildren,
+						queuedDurationMs,
 					);
 				};
-				const childResult = await (agent.mutating ? enqueueMutating(run, signal) : run());
+				const onQueued = onUpdate
+					? (elapsedMs: number, queuedAt: number) => onUpdate({
+						content: [{ type: "text", text: "Waiting for writer queue" }],
+						details: {
+							status: "running",
+							agent: agent.name,
+							description: agent.description,
+							source: agent.source,
+							task: params.task,
+							model: agent.model ?? defaults.model ?? "unconfigured",
+							thinking: agent.thinking ?? defaults.thinking ?? "off",
+							tools: agent.tools ?? null,
+							mutating: agent.mutating,
+							queuedAt,
+							queuedDurationMs: elapsedMs,
+							liveStatus: "queued",
+							liveActivity: "Waiting for the writer queue",
+							activeTools: [],
+							messages: [],
+							timeline: [],
+							usage: emptyUsage(),
+							stderr: "",
+						},
+					})
+					: undefined;
+				const childResult = await (agent.mutating ? enqueueMutating(run, signal, onQueued) : run());
 				const lastAssistant = getLastAssistant(childResult.messages);
 				if (childResult.outputLimitError) {
 					throw new Error(`Subagent "${agent.name}" failed: ${childResult.outputLimitError}`);
@@ -722,6 +974,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					tools: agent.tools ?? null,
 					mutating: agent.mutating,
 					startedAt: childResult.startedAt,
+					queuedDurationMs: childResult.queuedDurationMs,
 					durationMs: childResult.durationMs,
 					messages: childResult.messages,
 					timeline: childResult.timeline,
@@ -755,12 +1008,41 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 				const running = isPartial || details.status === "running";
 				const icon = running ? theme.fg("warning", "⏳") : theme.fg("success", "✓");
-				const duration = details.durationMs === undefined ? "" : ` · ${(details.durationMs / 1_000).toFixed(1)}s`;
-				const header = `${icon} ${theme.fg("accent", theme.bold(details.agent))} ${theme.fg("muted", `${details.model}:${details.thinking}${duration}`)}`;
+				const duration = details.durationMs === undefined ? "" : ` · ${(details.durationMs / 1_000).toFixed(1)}s child`;
+				const queuedDuration = details.queuedDurationMs === undefined ? "" : ` · ${(details.queuedDurationMs / 1_000).toFixed(1)}s queued`;
+				const header = `${icon} ${theme.fg("accent", theme.bold(details.agent))} ${theme.fg("muted", `${details.model}:${details.thinking}${queuedDuration}${duration}`)}`;
 
 				if (running) {
-					const last = details.timeline[details.timeline.length - 1];
-					return new Text(`${header}\n${theme.fg("dim", last?.text ?? "starting…")}`, 0, 0);
+					const activeTools = details.activeTools ?? [];
+					const activity = details.liveStatus === "queued"
+						? `waiting for writer queue · ${(details.queuedDurationMs ?? 0).toFixed(0)}ms`
+						: activeTools.length
+							? activeTools.length === 1
+								? `→ ${formatLiveLabel(activeTools[0])}`
+								: `→ ${activeTools.length} tools · ${formatLiveLabel(activeTools.at(-1)!)}`
+							: details.liveActivity
+								? `after ${formatLiveLabel(details.liveActivity)}`
+								: "";
+					const streamedText = details.liveText ?? "";
+					const excerpt = streamedText
+						? truncateLiveExcerpt(streamedText, expanded ? 3_000 : 600, expanded ? 20 : 4)
+						: "";
+					const toolProgress = details.liveToolProgress;
+					const toolExcerpt = toolProgress?.text
+						? truncateLiveExcerpt(toolProgress.text, expanded ? 3_000 : 600, expanded ? 20 : 4)
+						: "";
+					return new Text(
+						[
+							header,
+							theme.fg("warning", details.liveStatus ?? "starting"),
+							activity ? theme.fg("dim", activity) : "",
+							excerpt ? theme.fg("toolOutput", excerpt) : "",
+							toolExcerpt ? theme.fg("dim", `output from ${formatLiveLabel(toolProgress!.activity)} [${toolProgress!.toolCallId}]`) : "",
+							toolExcerpt ? theme.fg("toolOutput", toolExcerpt) : "",
+						].filter(Boolean).join("\n"),
+						0,
+						0,
+					);
 				}
 
 				const finalOutput = getFinalOutput(details.messages);
