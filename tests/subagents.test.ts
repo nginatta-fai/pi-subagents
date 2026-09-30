@@ -9,13 +9,15 @@ import { test, type TestContext } from "node:test";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type Theme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 import subagentsExtension from "../extensions/subagents/index.ts";
+import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
+import openAITierExtension from "../extensions/subagents/openai-tier.ts";
 import type { AgentConfig } from "../extensions/subagents/agents.ts";
 import { createSubagentSelector } from "../extensions/subagents/selector.ts";
 import { loadSelection, parseSelection, restoreSelection, saveSelection, SELECTION_ENTRY_TYPE } from "../extensions/subagents/selection.ts";
 
 const keybindings = new KeybindingsManager({
 	...TUI_KEYBINDINGS,
-	"app.models.save": { defaultKeys: "ctrl+s" },
+	"app.models.save": { defaultKeys: "ctrl+g" },
 	"app.models.enableAll": { defaultKeys: "ctrl+a" },
 	"app.models.clearAll": { defaultKeys: "ctrl+x" },
 });
@@ -28,7 +30,7 @@ const agents = ["reviewer", "scout", "worker"].map((name): AgentConfig => ({
 	name, description: `Role of ${name}`, model: "test/model", thinking: "low",
 	mutating: name === "worker", systemPrompt: "Test", source: "bundled", filePath: `${name}.md`,
 }));
-const keys = { enter: "\r", down: "\x1b[B", up: "\x1b[A", all: "\x01", none: "\x18", save: "\x13", escape: "\x1b", clear: "\x03" };
+const keys = { enter: "\r", down: "\x1b[B", up: "\x1b[A", left: "\x1b[D", right: "\x1b[C", space: " ", all: "\x01", none: "\x18", save: "\x07", escape: "\x1b", clear: "\x03" };
 
 function temporaryDirectory(t: TestContext) {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-test-"));
@@ -36,8 +38,9 @@ function temporaryDirectory(t: TestContext) {
 	return directory;
 }
 
-function sessionEntry(disabledAgents: string[]) {
-	return { type: "custom", customType: SELECTION_ENTRY_TYPE, data: { disabledAgents } };
+function sessionEntry(value: string[] | { disabledAgents: string[]; agentOverrides?: Record<string, any> }) {
+	const data = Array.isArray(value) ? { disabledAgents: value } : value;
+	return { type: "custom", customType: SELECTION_ENTRY_TYPE, data };
 }
 
 test("selection defaults, normalization, validation, and atomic persistence", (t) => {
@@ -63,39 +66,38 @@ test("restores only the last selection on the active branch, including all-enabl
 	assert.deepEqual(restoreSelection([sessionEntry(["scout"])], defaults), { disabledAgents: ["scout"] });
 });
 
-test("picker toggles, searches, applies all/none to search matches, saves, and retains changes on close", () => {
-	let disabled: string[] = [];
-	let saved: string[] | undefined;
+test("picker opens agent settings, applies enabled and bulk changes, saves, and retains edits on close", () => {
+	let selection: any = { disabledAgents: [] };
+	let saved: any;
 	let closed = false;
 	let renderRequests = 0;
 	const picker = createSubagentSelector({
-		agents, disabledAgents: new Set(), theme, keybindings,
+		agents, selection, models: [], theme, keybindings,
 		requestRender: () => { renderRequests++; },
-		onChange: (names) => { disabled = names; },
-		onSave: (names) => { saved = names; },
+		onChange: (next) => { selection = next; },
+		onSave: (next) => { saved = next; },
 		onClose: () => { closed = true; },
 	});
 	picker.handleInput(keys.down);
 	picker.handleInput(keys.enter);
-	assert.deepEqual(disabled, ["scout"]);
-	picker.handleInput(keys.up);
+	assert.deepEqual(selection.disabledAgents, [], "root Enter opens the selected agent submenu, not a toggle");
+	assert.match(picker.render(100).join("\n"), /Enabled/);
 	picker.handleInput(keys.enter);
-	assert.deepEqual(disabled, ["reviewer", "scout"]);
+	assert.deepEqual(selection.disabledAgents, ["scout"]);
+	picker.handleInput(keys.escape);
 	picker.handleInput("worker");
 	picker.handleInput(keys.none);
-	assert.deepEqual(disabled, ["reviewer", "scout", "worker"]);
-	picker.handleInput(keys.all);
-	assert.deepEqual(disabled, ["reviewer", "scout"]);
-	picker.handleInput(keys.clear); // Clear search without closing.
+	assert.deepEqual(selection.disabledAgents, ["scout", "worker"], "root bulk actions apply to search matches");
+	picker.handleInput(keys.clear);
 	assert.equal(closed, false);
-	picker.handleInput(keys.none);
-	assert.deepEqual(disabled, ["reviewer", "scout", "worker"]);
+	picker.handleInput(keys.all);
+	assert.deepEqual(selection.disabledAgents, []);
 	picker.handleInput(keys.save);
-	assert.deepEqual(saved, disabled);
+	assert.deepEqual(saved, selection);
 	assert.match(picker.render(100).join("\n"), /Saved as defaults/);
 	picker.handleInput(keys.escape);
 	assert.equal(closed, true);
-	assert.equal(disabled.length, 3);
+	assert.equal(selection.disabledAgents.length, 0);
 	assert.ok(renderRequests > 0);
 });
 
@@ -103,7 +105,7 @@ test("picker handles no matches, focus, scrolling, narrow widths, wide text, and
 	let changes = 0;
 	const picker = createSubagentSelector({
 		agents: Array.from({ length: 15 }, (_, index) => ({ ...agents[0], name: `agent-${index}`, description: "検証 🔎 ".repeat(10) })),
-		disabledAgents: new Set(), theme, keybindings, requestRender() {}, onClose() {},
+		selection: { disabledAgents: [] }, models: [], theme, keybindings, requestRender() {}, onClose() {},
 		onChange: () => { changes++; },
 		onSave: () => { throw new Error("read-only filesystem"); },
 	});
@@ -156,6 +158,7 @@ function extensionHarness(t: TestContext, defaults?: string[]) {
 	let activeTools = ["read", "bash"];
 	let inputKeys: string[] = [];
 	let customCalls = 0;
+	let latestSelector: ReturnType<typeof createSubagentSelector> | undefined;
 	const notifications: string[] = [];
 	const tools = new Map<string, ToolDefinition<any, any>>();
 	const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
@@ -174,7 +177,7 @@ function extensionHarness(t: TestContext, defaults?: string[]) {
 		},
 		getActiveTools: () => [...activeTools],
 		setActiveTools: (names: string[]) => { activeTools = names; },
-		appendEntry: (_type: string, data: { disabledAgents: string[] }) => branch.push(sessionEntry(data.disabledAgents)),
+		appendEntry: (_type: string, data: { disabledAgents: string[]; agentOverrides?: Record<string, any> }) => branch.push(sessionEntry(data)),
 	} as unknown as ExtensionAPI;
 	const ctx = {
 		cwd: root, mode: "tui", hasUI: true,
@@ -185,18 +188,40 @@ function extensionHarness(t: TestContext, defaults?: string[]) {
 			custom: async (factory: (...args: any[]) => ReturnType<typeof createSubagentSelector>) => {
 				customCalls++;
 				const component = factory({ requestRender() {} }, theme, keybindings, () => undefined);
+				latestSelector = component;
 				for (const input of inputKeys) component.handleInput(input);
 			},
 		},
 	} as unknown as ExtensionCommandContext;
+	const model = (provider: string, id: string, api = provider === "openai-codex" ? "openai-codex-responses" : "openai-responses", baseUrl = "https://api.openai.com/v1", reasoning = true) => ({
+		provider, id, name: id, api, baseUrl, reasoning,
+		thinkingLevelMap: { xhigh: "xhigh", max: "max" }, input: ["text"],
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32_000, maxTokens: 2_000,
+	});
+	const availableModels = [
+		model("openai", "gpt-6.1-sol"),
+		model("openai", "gpt-6-astra"),
+		model("openai-codex", "gpt-6-astra"),
+		model("other", "plain", "openai-responses", "https://example.test/v1", false),
+		model("other", "fixture-model", "openai-responses", "https://example.test/v1", false),
+	];
+	(ctx as any).model = availableModels[0];
+	(ctx as any).thinkingLevel = "medium";
+	(ctx as any).scopedModels = [];
+	(ctx as any).modelRegistry = {
+		getAvailable: () => availableModels,
+		find: (provider: string, id: string) => availableModels.find((candidate) => candidate.provider === provider && candidate.id === id),
+	};
 	subagentsExtension(pi);
 	return {
 		ctx, pi, root, agentDir, selectionPath, notifications,
 		get tool() { return tools.get("subagent")!; },
 		get activeTools() { return activeTools; },
 		get customCalls() { return customCalls; },
+		get selector() { return latestSelector; },
 		get branch() { return branch; },
 		setBranch: (entries: typeof branch) => { branch = entries; },
+		setScopedModels: (models: any[]) => { (ctx as any).scopedModels = models.map((model) => ({ model })); },
 		emit: (name: string) => events.get(name)?.({}, ctx),
 		command: (inputs: string[] = [], args = "") => {
 			inputKeys = inputs;
@@ -205,13 +230,100 @@ function extensionHarness(t: TestContext, defaults?: string[]) {
 	};
 }
 
+test("command keyboard settings honor model scope, persist per-agent model/thinking/priority, and restore branch/default state", async (t) => {
+	const harness = extensionHarness(t);
+	await harness.emit("session_start");
+	fs.mkdirSync(path.join(harness.agentDir, "agents"), { recursive: true });
+	fs.writeFileSync(path.join(harness.agentDir, "agents", "worker.md"), [
+		"---", "name: worker", "description: Worker integration override", "model: openai/gpt-6.1-sol", "thinking: high", "priority: fast", "tools: []", "---", "Worker.", "",
+	].join("\n"));
+	fs.writeFileSync(path.join(harness.agentDir, "agents", "scout.md"), [
+		"---", "name: scout", "description: Scout integration override", "model: other/plain", "thinking: high", "priority: fast", "tools: []", "---", "Scout.", "",
+	].join("\n"));
+	await harness.command([keys.space]);
+	assert.match(harness.selector!.render(100).join("\n"), /settings/, "Space activates the root selection when the query is empty");
+	await harness.command([keys.right]);
+	assert.match(harness.selector!.render(100).join("\n"), /settings/, "Right activates the root selection");
+	await harness.command(Array.from("worker role"));
+	assert.match(harness.selector!.render(100).join("\n"), /worker/, "individual spaces in a root query must be typed, not activate the selection");
+	await harness.command(["worker", keys.enter, ...Array.from("Reasoning effort")]);
+	assert.match(harness.selector!.render(100).join("\n"), /Reasoning effort/, "individual spaces in settings search must remain input");
+	await harness.command(["worker", keys.enter, keys.down, keys.enter, ...Array.from("Agent-file default")]);
+	assert.match(harness.selector!.render(100).join("\n"), /Choose model/, "individual spaces in model search must remain input");
+	const blockedPath = harness.selectionPath;
+	fs.mkdirSync(blockedPath);
+	await harness.command(["worker", keys.enter, keys.save]);
+	assert.match(harness.selector!.render(100).join("\n"), /Save failed:/, "save failure must remain visible in agent settings");
+	await harness.command(["worker", keys.enter, keys.down, keys.enter, keys.save]);
+	assert.match(harness.selector!.render(100).join("\n"), /Save failed:/, "save failure must remain visible in the model picker");
+	fs.rmSync(blockedPath, { recursive: true, force: true });
+	await harness.command(["worker", keys.enter, keys.down, keys.enter, keys.save]);
+	assert.match(harness.selector!.render(100).join("\n"), /Saved as defaults/, "save success must remain visible in the model picker");
+	assert.match(harness.selector!.render(100).join("\n"), /ctrl\+g/i, "hints must use the configured save key");
+	const astra = (harness.ctx.modelRegistry as any).getAvailable().find((model: any) => model.id === "gpt-6-astra");
+	harness.setScopedModels([astra]);
+	await harness.command([keys.down, keys.enter, keys.down, keys.down]);
+	assert.match(harness.selector!.render(100).join("\n"), /high \(effective off\)/, "file-default reasoning is displayed at the selected model's effective level");
+	await harness.command(["worker", keys.enter, keys.down, keys.down]);
+	assert.match(harness.selector!.render(100).join("\n"), /Supported by the selected model:.*high/, "reasoning options must resolve file-default models from the full registry, not only selectable models");
+	harness.selector!.handleInput(keys.down);
+	assert.match(harness.selector!.render(100).join("\n"), /fast sends service_tier=priority/, "an out-of-scope file-default model still has registry-backed fast priority metadata");
+	await harness.command(["worker", keys.enter, keys.down, keys.enter, "other/plain"]);
+	assert.match(harness.selector!.render(100).join("\n"), /No matching models/, "scoped model search must not expose an authenticated but out-of-scope model");
+	harness.selector!.handleInput(keys.escape);
+	harness.selector!.handleInput(keys.escape);
+	assert.doesNotMatch(harness.selector!.render(100).join("\n"), /scout/, "backing out preserves the root search query");
+
+	await harness.command(["worker", keys.enter, keys.down, keys.enter, "gpt-6-astra", keys.enter, keys.escape, keys.escape]);
+	assert.equal(harness.branch.at(-1)?.data.agentOverrides?.worker.model, "openai/gpt-6-astra");
+	await harness.command(["worker", keys.enter, "reasoning", ...Array.from({ length: 6 }, () => keys.enter), keys.escape, keys.escape]);
+	assert.equal(harness.branch.at(-1)?.data.agentOverrides?.worker.thinking, "high");
+	await harness.command(["worker", keys.enter, "priority"]);
+	harness.selector!.handleInput(keys.enter);
+	harness.selector!.handleInput(keys.enter);
+	harness.selector!.handleInput(keys.enter);
+	assert.match(harness.selector!.render(100).join("\n"), /6x Standard token prices/);
+	harness.selector!.handleInput(keys.save);
+	harness.selector!.handleInput(keys.escape);
+	harness.selector!.handleInput(keys.escape);
+	assert.equal(harness.branch.at(-1)?.data.agentOverrides?.worker.priority, "ultrafast");
+	assert.equal(loadSelection(harness.selectionPath).agentOverrides?.worker.priority, "ultrafast", "the configured save key persists complete agent settings");
+	assert.match(harness.tool.description, /priority: ultrafast/);
+
+	const overrideEntry = harness.branch.at(-1)!;
+	harness.setScopedModels([]); // Unscoped mode falls back to authenticated available models.
+	await harness.command(["worker", keys.enter, keys.down, keys.enter, "other/plain", keys.enter]);
+	assert.equal(harness.branch.at(-1)?.data.agentOverrides?.worker.model, "other/plain");
+	assert.match(harness.selector!.render(100).join("\n"), /high \(effective off\)/, "reasoning UI must show the model-supported effective level without replacing the saved request");
+	assert.equal(harness.branch.at(-1)?.data.agentOverrides?.worker.priority, "default", "changing away from Astra must clear invalid ultrafast rather than silently retain it");
+	assert.match(harness.selector!.render(100).join("\n"), /Ultrafast reset to default/);
+	await harness.command(["worker", keys.enter, "reset"]);
+	harness.selector!.handleInput(keys.enter);
+	harness.selector!.handleInput(keys.escape);
+	harness.selector!.handleInput(keys.escape);
+	assert.equal(harness.branch.at(-1)?.data.agentOverrides, undefined, "Reset removes settings overrides without editing agent Markdown");
+
+	harness.setBranch([overrideEntry]);
+	await harness.emit("session_tree");
+	await harness.command(Array.from("ultrafast"));
+	assert.match(harness.selector!.render(100).join("\n"), /worker/, "root search must include effective session overrides, not only agent-file defaults");
+	assert.ok(harness.tool.description.includes("openai/gpt-6-astra"));
+	assert.match(harness.tool.description, /priority: ultrafast/);
+	harness.setBranch([]);
+	await harness.emit("session_tree");
+	assert.match(harness.tool.description, /priority: ultrafast/, "saved defaults are used on branches without a selection entry");
+	await harness.emit("session_shutdown");
+	await harness.emit("session_start");
+	assert.match(harness.tool.description, /priority: ultrafast/);
+});
+
 test("command immediately updates schema, catalogue, and routing; stale tool calls cannot dispatch disabled agents", async (t) => {
 	const harness = extensionHarness(t);
 	await harness.emit("session_start");
 	const originalTool = harness.tool;
 	assert.deepEqual(originalTool.parameters.properties.agent.enum, ["reviewer", "scout", "worker"]);
 	assert.match(originalTool.promptSnippet!, /use worker by default/);
-	await harness.command(["worker", keys.enter, keys.escape]);
+	await harness.command(["worker", keys.enter, keys.enter, keys.escape, keys.escape]);
 	assert.deepEqual(harness.tool.parameters.properties.agent.enum, ["reviewer", "scout"]);
 	assert.doesNotMatch(harness.tool.description, /- worker:/);
 	assert.doesNotMatch(harness.tool.promptSnippet!, /worker/);
@@ -233,7 +345,7 @@ test("all off removes the tool, all on restores it, and other tool selections re
 	await harness.command([keys.all, keys.escape]);
 	assert.deepEqual(harness.activeTools, ["read", "bash", "subagent"]);
 	harness.pi.setActiveTools(["read"]); // Simulate an independent /tools selection.
-	await harness.command(["scout", keys.enter, keys.escape]);
+	await harness.command(["scout", keys.enter, keys.enter, keys.escape, keys.escape]);
 	assert.deepEqual(harness.activeTools, ["read"]);
 });
 
@@ -241,7 +353,7 @@ test("saved defaults, reload/resume, tree navigation, and session replacement re
 	const harness = extensionHarness(t, ["scout"]);
 	await harness.emit("session_start");
 	assert.deepEqual(harness.tool.parameters.properties.agent.enum, ["reviewer", "worker"]);
-	await harness.command(["worker", keys.enter, keys.save, keys.escape]);
+	await harness.command(["worker", keys.enter, keys.enter, keys.save, keys.escape, keys.escape]);
 	assert.deepEqual(loadSelection(harness.selectionPath).disabledAgents, ["scout", "worker"]);
 	// New global defaults must not override an explicit selection in a resumed branch.
 	saveSelection(harness.selectionPath, { disabledAgents: [] });
@@ -258,10 +370,16 @@ test("saved defaults, reload/resume, tree navigation, and session replacement re
 
 test("invalid defaults fail closed with a warning; non-TUI mode lists without opening custom UI", async (t) => {
 	const harness = extensionHarness(t, []);
-	fs.writeFileSync(harness.selectionPath, "{bad json");
+	fs.writeFileSync(harness.selectionPath, JSON.stringify({ disabledAgents: [], agentOverrides: { worker: { priority: "turbo" } } }));
 	await harness.emit("session_start");
 	assert.deepEqual(harness.activeTools, ["read", "bash"]);
-	assert.match(harness.notifications[0], /Could not read/);
+	assert.match(harness.notifications[0], /agentOverrides.*priority is invalid/);
+	for (const model of ["/", "provider/", "/model"]) {
+		fs.writeFileSync(harness.selectionPath, JSON.stringify({ disabledAgents: [], agentOverrides: { worker: { model } } }));
+		await harness.emit("session_start");
+		assert.deepEqual(harness.activeTools, ["read", "bash"], `${JSON.stringify(model)} must fail closed at command startup`);
+		assert.match(harness.notifications.at(-1)!, /model must be a provider\/model reference/);
+	}
 	harness.ctx.mode = "rpc";
 	await harness.command();
 	assert.equal(harness.customCalls, 0);
@@ -278,7 +396,7 @@ test("disabled state applies by name to custom/trusted overrides without loading
 	harness.ctx.isProjectTrusted = () => true;
 	await harness.emit("session_start");
 	assert.doesNotMatch(harness.tool.description, /Trusted helper/);
-	await harness.command(["helper", keys.enter, keys.escape]);
+	await harness.command(["helper", keys.enter, keys.enter, keys.escape, keys.escape]);
 	assert.match(harness.tool.description, /Trusted helper/);
 	assert.ok(harness.tool.parameters.properties.agent.enum.includes("helper"));
 });
@@ -294,7 +412,7 @@ test("a queued worker invocation is checked again after being disabled", async (
 	});
 	const pending = harness.tool.execute("call", { agent: "worker", task: "test" }, undefined, undefined, harness.ctx);
 	const rejected = assert.rejects(pending, /is disabled/);
-	await harness.command(["worker", keys.enter, keys.escape]);
+	await harness.command(["worker", keys.enter, keys.enter, keys.escape, keys.escape]);
 	await rejected;
 });
 
@@ -318,7 +436,7 @@ test("Pi runtime refreshes tool definitions and system instructions without relo
 		sessionManager: SessionManager.inMemory(harness.root),
 	});
 	t.after(() => session.dispose());
-	let inputKeys = ["worker", keys.enter, keys.escape];
+	let inputKeys = ["worker", keys.enter, keys.enter, keys.escape, keys.escape];
 	const errors: string[] = [];
 	await session.bindExtensions({
 		mode: "tui",
@@ -656,18 +774,19 @@ test("live preview timers are cleaned up after child abort and spawn failure", a
 	assert.equal(spawnUpdates.length, spawnUpdateCount, "the elapsed-time timer must stop after spawn failure");
 });
 
-test("per-agent OpenAI fast mode reaches real child requests without leaking across agents", async (t) => {
+test("legacy per-agent OpenAI settings and session model/thinking overrides reach real child requests", async (t) => {
 	const harness = extensionHarness(t);
-	const requests: Array<{ task: string; tier: unknown; temperature: unknown; leaked?: unknown; model: unknown; stream: unknown }> = [];
+	const requests: Array<{ task: string; tier: unknown; temperature: unknown; reasoning: any; summary: boolean; leaked?: unknown; model: unknown; stream: unknown }> = [];
 	const counts = new Map<string, number>();
-	const taskNames = ["PRIORITY_AGENT", "PRIORITY_MISSING_TIER_AGENT", "PRIORITY_DEFAULT_RESPONSE_AGENT", "DEFAULT_AGENT", "OMITTED_AGENT", "OTHER_PROVIDER", "MULTI_TURN_AGENT", "PRIORITY_SAMPLING_DEFAULT", "DEFAULT_SAMPLING_PRIORITY", "OMITTED_SAMPLING_PRIORITY"];
+	const taskNames = ["PRIORITY_AGENT", "PRIORITY_MISSING_TIER_AGENT", "PRIORITY_DEFAULT_RESPONSE_AGENT", "DEFAULT_AGENT", "OMITTED_AGENT", "OTHER_PROVIDER", "MULTI_TURN_AGENT", "PRIORITY_SAMPLING_DEFAULT", "DEFAULT_SAMPLING_PRIORITY", "OMITTED_SAMPLING_PRIORITY", "ULTRAFAST_UNSUPPORTED_AGENT", "PRIORITY_FIELD_OVERRIDE", "RESTORED_INCOMPATIBLE"];
 	const server = createServer(async (request, response) => {
 		const chunks: Buffer[] = [];
 		for await (const chunk of request) chunks.push(Buffer.from(chunk));
 		const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 		const serialized = JSON.stringify(body);
 		const task = taskNames.find((name) => serialized.includes(name)) ?? "UNKNOWN_TASK";
-		requests.push({ task, tier: body.service_tier, temperature: body.temperature, leaked: body.discovered_extension_marker, model: body.model, stream: body.stream });
+		const summary = serialized.includes("context summarization assistant");
+		requests.push({ task, tier: body.service_tier, temperature: body.temperature, reasoning: body.reasoning, summary, leaked: body.discovered_extension_marker, model: body.model, stream: body.stream });
 		const requestNumber = (counts.get(task) ?? 0) + 1;
 		counts.set(task, requestNumber);
 		const events: object[] = [];
@@ -685,14 +804,15 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 				{ type: "response.output_item.done", output_index: 0, item: output },
 			);
 		} else {
+			const responseText = summary ? "## Goal\nContinue the task." : `completed ${task}`;
 			output = {
 				type: "message", id: `msg_${task}_${requestNumber}`, role: "assistant",
-				content: [{ type: "output_text", text: `completed ${task}`, annotations: [] }],
+				content: [{ type: "output_text", text: responseText, annotations: [] }],
 				status: "completed",
 			};
 			events.push(
 				{ type: "response.output_item.added", output_index: 0, item: { ...output, content: [] } },
-				{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: `completed ${task}` },
+				{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: responseText },
 				{ type: "response.output_item.done", output_index: 0, item: output },
 			);
 		}
@@ -703,9 +823,9 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 				status: "completed",
 				output: [output],
 				usage: {
-					input_tokens: 10,
+					input_tokens: task === "ULTRAFAST_UNSUPPORTED_AGENT" && !summary ? 900 : 10,
 					output_tokens: 5,
-					total_tokens: 15,
+					total_tokens: task === "ULTRAFAST_UNSUPPORTED_AGENT" && !summary ? 905 : 15,
 					input_tokens_details: { cached_tokens: 0 },
 					output_tokens_details: { reasoning_tokens: 0 },
 				},
@@ -724,7 +844,8 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 	fs.writeFileSync(path.join(harness.root, "fixture.txt"), "multi-turn fixture content");
 	const samplingModels = [
 		{ id: "fixture-model", name: "Fixture", input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
-		{ id: "priority-sampling-default", name: "Priority sampling fixture", samplingParams: { service_tier: "default", temperature: 0.2 }, input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
+		{ id: "gpt-6-astra", name: "Local Astra eligibility fixture", input: ["text"], reasoning: false, contextWindow: 1_024, maxTokens: 512 },
+		{ id: "priority-sampling-default", name: "Priority sampling fixture", samplingParams: { service_tier: "default", temperature: 0.2 }, input: ["text"], reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" }, contextWindow: 32_000, maxTokens: 2_000 },
 		{ id: "default-sampling-priority", name: "Default sampling fixture", samplingParams: { service_tier: "priority", temperature: 0.3 }, input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
 		{ id: "omitted-sampling-priority", name: "Omitted sampling fixture", samplingParams: { service_tier: "priority", temperature: 0.4 }, input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000 },
 	].map((model) => ({ ...model, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } }));
@@ -739,10 +860,10 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 		},
 	} }));
 	fs.writeFileSync(path.join(harness.agentDir, "extensions", "unwanted.ts"), `export default (pi) => pi.on("before_provider_request", (event) => ({ ...event.payload, discovered_extension_marker: true }));\n`);
-	const agent = (name: string, provider: string, fast: string | undefined, tools = "[]", model = "fixture-model") => {
+	const agent = (name: string, provider: string, fast: string | undefined, tools = "[]", model = "fixture-model", priority?: string) => {
 		fs.writeFileSync(path.join(harness.agentDir, "agents", `${name}.md`), [
 			"---", `name: ${name}`, `description: ${name} test agent`, `model: ${provider}/${model}`, `tools: ${tools}`,
-			...(fast === undefined ? [] : [`fast: ${fast}`]), "---", "Test integration agent.", "",
+			...(priority ? [`priority: ${priority}`] : []), ...(fast === undefined ? [] : [`fast: ${fast}`]), "---", "Test integration agent.", "",
 		].join("\n"));
 	};
 	agent("priority-agent", "openai", "true");
@@ -755,6 +876,15 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 	agent("priority-sampling-default", "openai", "true", "[]", "priority-sampling-default");
 	agent("default-sampling-priority", "openai", "false", "[]", "default-sampling-priority");
 	agent("omitted-sampling-priority", "openai", undefined, "[]", "omitted-sampling-priority");
+	agent("priority-field-default", "openai", "true", "[]", "fixture-model", "default");
+	fs.writeFileSync(path.join(harness.agentDir, "agents", "ultrafast-local.md"), [
+		"---", "name: ultrafast-local", "description: Ultrafast endpoint gating integration fixture", "model: openai/gpt-6-astra", "priority: ultrafast", "tools: []", "---", "Fixture.", "",
+	].join("\n"));
+	fs.writeFileSync(path.join(harness.agentDir, "settings.json"), JSON.stringify({ compaction: { reserveTokens: 128, keepRecentTokens: 1 } }));
+	const originalFind = (harness.ctx.modelRegistry as any).find;
+	(harness.ctx.modelRegistry as any).find = (provider: string, id: string) => provider === "openai" && id === "gpt-6-astra"
+		? { ...originalFind(provider, id), baseUrl, contextWindow: 1_024, maxTokens: 512 }
+		: originalFind(provider, id);
 	fs.writeFileSync(path.join(harness.agentDir, "agents", "invalid-fast.md"), "---\nname: invalid-fast\ndescription: Invalid fast setting\nfast: yes\ntools: []\n---\nInvalid fixture.\n");
 
 	const originalScript = process.argv[1];
@@ -775,6 +905,11 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 		else process.env.PI_OFFLINE = previousOffline;
 	});
 	await harness.emit("session_start");
+	harness.setBranch([sessionEntry({
+		disabledAgents: [],
+		agentOverrides: { "priority-agent": { model: "openai/priority-sampling-default", thinking: "high", priority: "fast" } },
+	})]);
+	await harness.emit("session_tree");
 
 	const invoke = (name: string, task: string) => harness.tool.execute(
 		`fast-mode-${name}`, { agent: name, task }, undefined, undefined, harness.ctx,
@@ -791,18 +926,32 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 		invoke("default-sampling-priority", "DEFAULT_SAMPLING_PRIORITY"),
 		invoke("omitted-sampling-priority", "OMITTED_SAMPLING_PRIORITY"),
 	]);
+	const ultrafastResult = await invoke("ultrafast-local", "ULTRAFAST_UNSUPPORTED_AGENT");
+	const priorityDefaultResult = await invoke("priority-field-default", "PRIORITY_FIELD_OVERRIDE");
 	assert.deepEqual(results.map((result) => result.details.fast), [true, true, true, false, undefined, true, true, true, false, undefined]);
+	assert.equal(results[0].details.model, "openai/priority-sampling-default", "a session model override must reach the child CLI dispatch");
+	assert.equal(results[0].details.thinking, "high", "a session reasoning override must reach the child dispatch");
+	assert.equal(priorityDefaultResult.details.priority, "default", "priority frontmatter supersedes legacy fast metadata");
+	assert.equal(priorityDefaultResult.details.fast, false, "legacy details expose the superseding default setting");
 	assert.ok(Math.abs(results[0].details.usage.cost.total - 0.00003) < 1e-9, "reported priority service tier should be reflected in usage pricing");
 	assert.ok(Math.abs(results[1].details.usage.cost.total - 0.00003) < 1e-9, "the requested tier should price usage when the response omits service_tier");
 	assert.ok(Math.abs(results[2].details.usage.cost.total - 0.000015) < 1e-9, "an explicit OpenAI response tier of default remains authoritative");
 	assert.equal(results[6].details.messages.length > 1, true, "the multi-turn agent should complete a tool round trip");
 	assert.equal(counts.get("MULTI_TURN_AGENT"), 2, "both model turns should reach the simulated endpoint");
 	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_AGENT").map((request) => request.tier), ["priority"]);
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_AGENT").map((request) => request.model), ["priority-sampling-default"]);
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_AGENT").map((request) => request.reasoning?.effort), ["high"]);
 	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_MISSING_TIER_AGENT").map((request) => request.tier), ["priority"]);
 	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_DEFAULT_RESPONSE_AGENT").map((request) => request.tier), ["priority"]);
 	assert.deepEqual(requests.filter((request) => request.task === "DEFAULT_AGENT").map((request) => request.tier), ["default"]);
 	assert.deepEqual(requests.filter((request) => request.task === "OMITTED_AGENT").map((request) => request.tier), [undefined]);
 	assert.deepEqual(requests.filter((request) => request.task === "OTHER_PROVIDER").map((request) => request.tier), [undefined]);
+	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_FIELD_OVERRIDE").map((request) => request.tier), ["default"]);
+	const ultrafastRequests = requests.filter((request) => request.model === "gpt-6-astra");
+	assert.ok(ultrafastRequests.length >= 2 && ultrafastRequests.some((request) => request.summary), "the small-context Astra fixture should exercise automatic compaction");
+	assert.ok(ultrafastRequests.every((request) => request.tier === undefined), "ultrafast must not be injected for a local Astra endpoint or compaction request");
+	assert.equal(ultrafastResult.details.priority, "ultrafast");
+	assert.match(ultrafastResult.details.priorityStatus, /unsupported; not applied/);
 	assert.deepEqual(requests.filter((request) => request.task === "MULTI_TURN_AGENT").map((request) => request.tier), ["priority", "priority"]);
 	assert.deepEqual(requests.filter((request) => request.task === "PRIORITY_SAMPLING_DEFAULT").map((request) => request.tier), ["priority"], "fast priority must override conflicting model samplingParams.service_tier");
 	assert.deepEqual(requests.filter((request) => request.task === "DEFAULT_SAMPLING_PRIORITY").map((request) => request.tier), ["default"], "fast default must override conflicting model samplingParams.service_tier");
@@ -813,13 +962,90 @@ test("per-agent OpenAI fast mode reaches real child requests without leaking acr
 	assert.ok(requests.every((request) => typeof request.model === "string" && request.stream === true), "the native provider wrapper must preserve unrelated request fields");
 	assert.equal(process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER, "priority", "child dispatch must not mutate the parent environment");
 	const resultPreview = harness.tool.renderResult!(results[0] as any, { expanded: false, isPartial: false }, theme, {} as any).render(120).join("\n");
-	assert.match(resultPreview, /fast: priority/);
+	assert.match(resultPreview, /priority: fast/);
+	const legacyDetails = { ...results[0].details } as any;
+	delete legacyDetails.priorityStatus;
+	delete legacyDetails.priority;
+	const legacyPreview = harness.tool.renderResult!({ ...results[0], details: legacyDetails } as any, { expanded: false, isPartial: false }, theme, {} as any).render(120).join("\n");
+	assert.match(legacyPreview, /priority: fast/, "persisted pre-priority details must derive status from legacy fast metadata");
 	await harness.command([], "list");
-	assert.match(harness.notifications.at(-1)!, /fast: priority/);
-	assert.match(harness.notifications.at(-1)!, /fast: default/);
-	assert.match(harness.notifications.at(-1)!, /fast: unchanged/);
+	assert.match(harness.notifications.at(-1)!, /priority: fast/);
+	assert.match(harness.notifications.at(-1)!, /priority: default/);
+	assert.match(harness.notifications.at(-1)!, /priority: unchanged/);
 	assert.ok(harness.notifications.some((notification) => /fast must be true or false/.test(notification)));
 	assert.doesNotMatch(harness.tool.description, /invalid-fast/);
+
+	// Saved defaults are reloaded on session start when no branch entry overrides them.
+	saveSelection(harness.selectionPath, {
+		disabledAgents: [],
+		agentOverrides: { "priority-agent": { model: "other/fixture-model", thinking: "high", priority: "fast" } },
+	});
+	harness.setBranch([]);
+	await harness.emit("session_start");
+	assert.match(harness.tool.description, /other\/fixture-model; thinking: off/, "catalogue reasoning reflects the model's native clamp after reloading saved settings");
+	const restoredResult = await invoke("priority-agent", "RESTORED_INCOMPATIBLE");
+	assert.equal(restoredResult.details.model, "other/fixture-model");
+	assert.equal(restoredResult.details.thinking, "off", "restored incompatible reasoning is clamped before child CLI dispatch");
+	assert.deepEqual(requests.filter((request) => request.task === "RESTORED_INCOMPATIBLE").map((request) => request.reasoning), [undefined]);
+});
+
+test("ultrafast tier reaches a native OpenAI request only for the API Astra model", async (t) => {
+	const previousTier = process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+	const previousFetch = globalThis.fetch;
+	process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = "ultrafast";
+	const requests: Array<{ url: string; body: Record<string, any> }> = [];
+	globalThis.fetch = async (input, init) => {
+		requests.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+		const output = {
+			type: "message", id: "msg_native_ultrafast", role: "assistant",
+			content: [{ type: "output_text", text: "native provider completed", annotations: [] }], status: "completed",
+		};
+		const events = [
+			{ type: "response.output_item.added", output_index: 0, item: { ...output, content: [] } },
+			{ type: "response.output_text.delta", output_index: 0, content_index: 0, delta: "native provider completed" },
+			{ type: "response.output_item.done", output_index: 0, item: output },
+			{ type: "response.completed", response: {
+				id: "resp_native_ultrafast", status: "completed", output: [output],
+				usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+			} },
+		];
+		return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", {
+			status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+		});
+	};
+	t.after(() => {
+		globalThis.fetch = previousFetch;
+		if (previousTier === undefined) delete process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER;
+		else process.env.PI_SUBAGENTS_OPENAI_SERVICE_TIER = previousTier;
+	});
+
+	const nativeProvider = openaiProvider();
+	let onSessionStart: ((event: unknown, ctx: any) => void) | undefined;
+	let wrappedProvider: any;
+	openAITierExtension({
+		on: (_event: string, handler: (event: unknown, ctx: any) => void) => { onSessionStart = handler; },
+		registerProvider: (provider: any) => { wrappedProvider = provider; },
+	} as any);
+	onSessionStart?.({}, { modelRegistry: { getProvider: () => nativeProvider } });
+	const model = (id: string, baseUrl = "https://api.openai.com/v1") => ({
+		provider: "openai", id, name: id, api: "openai-responses", baseUrl,
+		reasoning: false, input: ["text"], contextWindow: 32_000, maxTokens: 2_000,
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+	});
+	const run = (target: ReturnType<typeof model>, simple = false) => simple
+		? wrappedProvider.streamSimple(target, { messages: [] }, { apiKey: "integration-test-key", temperature: 0.4 }).result()
+		: wrappedProvider.stream(target, { messages: [] }, { apiKey: "integration-test-key", samplingParams: { temperature: 0.2 } }).result();
+
+	await run(model("gpt-6-astra"));
+	assert.equal(requests.at(-1)?.url, "https://api.openai.com/v1/responses");
+	assert.equal(requests.at(-1)?.body.service_tier, "ultrafast");
+	assert.equal(requests.at(-1)?.body.temperature, 0.2);
+	await run(model("gpt-6-astra"), true);
+	assert.equal(requests.at(-1)?.body.service_tier, "ultrafast", "native simple requests carry the tier to the HTTP request");
+	await run(model("gpt-6.1-sol"));
+	assert.equal(requests.at(-1)?.body.service_tier, undefined, "the model gate prevents ultrafast from reaching other native models");
+	await run(model("gpt-6-astra", "https://example.test/v1"));
+	assert.equal(requests.at(-1)?.body.service_tier, undefined, "a non-official endpoint is never eligible");
 });
 
 test("fast provider wrapping preserves a persisted remote-only OpenAI catalog model", async (t) => {

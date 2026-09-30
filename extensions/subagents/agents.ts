@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentPriority } from "./selection.ts";
 import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
@@ -17,6 +18,7 @@ export interface AgentConfig {
 	thinking?: ThinkingLevel;
 	tools?: string[];
 	fast?: boolean;
+	priority?: AgentPriority;
 	mutating: boolean;
 	systemPrompt: string;
 	source: AgentSource;
@@ -38,6 +40,7 @@ type AgentFrontmatter = {
 	thinking?: unknown;
 	tools?: unknown;
 	fast?: unknown;
+	priority?: unknown;
 	mutating?: unknown;
 };
 
@@ -141,6 +144,10 @@ function loadAgentsFromDir(
 				diagnostics.push(`${filePath}: fast must be true or false`);
 				continue;
 			}
+			if (frontmatter.priority !== undefined && !["default", "fast", "ultrafast"].includes(frontmatter.priority as string)) {
+				diagnostics.push(`${filePath}: priority must be default, fast, or ultrafast`);
+				continue;
+			}
 			if (frontmatter.mutating !== undefined && typeof frontmatter.mutating !== "boolean") {
 				diagnostics.push(`${filePath}: mutating must be true or false`);
 				continue;
@@ -179,6 +186,7 @@ function loadAgentsFromDir(
 				thinking: frontmatter.thinking as ThinkingLevel | undefined,
 				tools: parsedTools.tools,
 				fast: frontmatter.fast as boolean | undefined,
+				priority: frontmatter.priority as AgentPriority | undefined,
 				mutating: hasMutationCapableTools || frontmatter.mutating === true,
 				systemPrompt: body.trim(),
 				source,
@@ -232,8 +240,15 @@ export function formatAgentCatalog(agents: AgentConfig[]): string {
 					: agent.tools.length === 0
 						? "none"
 						: agent.tools.join(", ");
-			const fast = agent.fast === undefined ? "unchanged" : agent.fast ? "priority" : "default";
-			return `- ${agent.name}: ${agent.description} [model: ${model}; thinking: ${thinking}; fast: ${fast}; tools: ${tools}; ${agent.mutating ? "may mutate files" : "read-only"}]`;
+			const priority = agent.priority ?? (agent.fast === undefined ? undefined : agent.fast ? "fast" : "default");
+			const priorityText = priority === undefined
+				? "unchanged"
+				: priority === "ultrafast"
+					? "ultrafast (API GPT-6 Astra only)"
+					: priority === "fast"
+						? "fast (OpenAI Responses only)"
+						: "default (OpenAI Responses only)";
+			return `- ${agent.name}: ${agent.description} [model: ${model}; thinking: ${thinking}; priority: ${priorityText}; tools: ${tools}; ${agent.mutating ? "may mutate files" : "read-only"}]`;
 		})
 		.join("\n");
 }

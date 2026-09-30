@@ -1,9 +1,9 @@
 ---
 name: reviewer
 description: Independent, read-only review for correctness, security, regressions, and maintainability
-model: openai-codex/gpt-6-sol
+model: openai-codex/gpt-6.1-sol
 thinking: xhigh
-fast: false
+priority: default
 tools: [read, grep, find]
 mutating: false
 ---

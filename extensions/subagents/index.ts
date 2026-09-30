@@ -5,7 +5,8 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, StringEnum } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Message, Usage } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
@@ -22,7 +23,16 @@ import {
 	formatAgentCatalog,
 } from "./agents.ts";
 import { createSubagentSelector } from "./selector.ts";
-import { loadSelection, restoreSelection, saveSelection, SELECTION_ENTRY_TYPE } from "./selection.ts";
+import {
+	type AgentPriority,
+	type AgentSettingsOverride,
+	type SubagentSelection,
+	loadSelection,
+	restoreSelection,
+	saveSelection,
+	SELECTION_ENTRY_TYPE,
+} from "./selection.ts";
+import { formatPriority, wireServiceTier } from "./priority.ts";
 
 const MAX_MODEL_OUTPUT_BYTES = 50 * 1024;
 const OPENAI_TIER_EXTENSION = path.join(path.dirname(fileURLToPath(import.meta.url)), "openai-tier.ts");
@@ -78,6 +88,8 @@ interface SubagentDetails {
 	thinking: ThinkingLevel;
 	tools: string[] | null;
 	fast?: boolean;
+	priority?: AgentPriority;
+	priorityStatus?: string;
 	mutating: boolean;
 	startedAt?: number;
 	queuedAt?: number;
@@ -111,6 +123,30 @@ interface ChildResult {
 }
 
 type UpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
+
+function applyAgentSettings(
+	agent: AgentConfig,
+	override: AgentSettingsOverride | undefined,
+	defaults: DispatchDefaults,
+	resolveModel?: (provider: string, id: string) => Model<Api> | undefined,
+): AgentConfig {
+	const priority = override?.priority ?? agent.priority ??
+		(agent.fast === undefined ? undefined : agent.fast ? "fast" : "default");
+	const configured = {
+		...agent,
+		model: Object.hasOwn(override ?? {}, "model") ? override?.model ?? defaults.model : agent.model ?? defaults.model,
+		thinking: Object.hasOwn(override ?? {}, "thinking") ? override?.thinking ?? defaults.thinking : agent.thinking ?? defaults.thinking,
+		priority,
+		fast: priority === undefined ? agent.fast : priority !== "default",
+	};
+	const reference = configured.model;
+	const separator = reference?.indexOf("/") ?? -1;
+	if (configured.thinking && reference && separator > 0 && separator < reference.length - 1 && resolveModel) {
+		const model = resolveModel(reference.slice(0, separator), reference.slice(separator + 1));
+		if (model) configured.thinking = clampThinkingLevel(model, configured.thinking);
+	}
+	return configured;
+}
 
 function emptyUsage(): Usage {
 	return {
@@ -346,6 +382,7 @@ async function runChildAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: UpdateCallback | undefined,
 	activeChildren: Set<ChildProcess>,
+	priorityStatus: string,
 	queuedDurationMs?: number,
 ): Promise<ChildResult> {
 	if (signal?.aborted) throw new Error(`Subagent "${agent.name}" was aborted before it started`);
@@ -375,7 +412,7 @@ async function runChildAgent(
 		if (agent.tools.length === 0) args.push("--no-tools");
 		else args.push("--tools", agent.tools.join(","));
 	}
-	if (agent.fast !== undefined) args.push("--extension", OPENAI_TIER_EXTENSION);
+	if (agent.priority !== undefined) args.push("--extension", OPENAI_TIER_EXTENSION);
 	args.push("--append-system-prompt", prompt.filePath, "--", `Task: ${task}`);
 
 	const messages: Message[] = [];
@@ -406,6 +443,8 @@ async function runChildAgent(
 		thinking,
 		tools: agent.tools ?? null,
 		fast: agent.fast,
+		priority: agent.priority,
+		priorityStatus,
 		mutating: agent.mutating,
 		startedAt,
 		durationMs: Date.now() - startedAt,
@@ -447,8 +486,9 @@ async function runChildAgent(
 			PI_SUBAGENT_DEPTH: String(depth + 1),
 			PI_SUBAGENT_PARENT_SESSION_ID: process.env.PI_SESSION_ID ?? "",
 		};
-		if (agent.fast === undefined) delete childEnv[OPENAI_TIER_ENV];
-		else childEnv[OPENAI_TIER_ENV] = agent.fast ? "priority" : "default";
+		const serviceTier = wireServiceTier(agent.priority);
+		if (serviceTier === undefined) delete childEnv[OPENAI_TIER_ENV];
+		else childEnv[OPENAI_TIER_ENV] = serviceTier;
 		const child = spawn(invocation.command, invocation.args, {
 			cwd,
 			detached: process.platform !== "win32",
@@ -749,6 +789,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let mutatingQueued = 0;
 	let mutatingRunning = false;
 	let runtimeActive = true;
+	let selection: SubagentSelection = { disabledAgents: [] };
 	let disabledAgents = new Set<string>();
 	let toolDisabledBySelection = false;
 	const selectionPath = path.join(getAgentDir(), "subagents.json");
@@ -826,24 +867,37 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				ctx.ui.notify(`Configuration warnings:\n${discovery.diagnostics.join("\n")}`, "warning");
 			}
 			if (args.trim() === "list" || ctx.mode !== "tui" || !discovery.agents.length) {
-				const catalog = discovery.agents.map((agent) =>
-					`${disabledAgents.has(agent.name) ? "[disabled]" : "[enabled]"} ${formatAgentCatalog([agent])}`,
-				).join("\n");
+				const defaults = {
+					model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+					thinking: ctx.thinkingLevel,
+				};
+				const catalog = discovery.agents.map((agent) => {
+					const configured = applyAgentSettings(agent, selection.agentOverrides?.[agent.name], defaults, (provider, id) => ctx.modelRegistry.find(provider, id));
+					return `${disabledAgents.has(agent.name) ? "[disabled]" : "[enabled]"} ${formatAgentCatalog([configured])}`;
+				}).join("\n");
 				ctx.ui.notify(catalog || "No agents found.", "info");
 				return;
 			}
+			const models = ctx.scopedModels.length
+				? ctx.scopedModels.map(({ model }) => model)
+				: ctx.modelRegistry.getAvailable();
 			await ctx.ui.custom<void>((tui, theme, keybindings, done) => createSubagentSelector({
 				agents: discovery.agents,
-				disabledAgents,
+				selection,
+				models,
+				resolveModel: (provider, id) => ctx.modelRegistry.find(provider, id),
+				parentModel: ctx.model,
+				parentThinking: ctx.thinkingLevel,
 				theme,
 				keybindings,
 				requestRender: () => tui.requestRender(),
-				onChange: (names) => {
-					pi.appendEntry(SELECTION_ENTRY_TYPE, { disabledAgents: names });
-					disabledAgents = new Set(names);
+				onChange: (next) => {
+					selection = next;
+					disabledAgents = new Set(next.disabledAgents);
+					pi.appendEntry(SELECTION_ENTRY_TYPE, next);
 					refreshTool(ctx);
 				},
-				onSave: (names) => saveSelection(selectionPath, { disabledAgents: names }),
+				onSave: (next) => saveSelection(selectionPath, next),
 				onClose: () => done(undefined),
 			}));
 		},
@@ -851,7 +905,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	function refreshTool(ctx: ExtensionContext) {
 		const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
-		const enabledAgents = discovery.agents.filter((agent) => !disabledAgents.has(agent.name));
+		const defaults = {
+			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			thinking: ctx.thinkingLevel,
+		};
+		const enabledAgents = discovery.agents
+			.filter((agent) => !disabledAgents.has(agent.name))
+			.map((agent) => applyAgentSettings(agent, selection.agentOverrides?.[agent.name], defaults, (provider, id) => ctx.modelRegistry.find(provider, id)));
 		const agentNames = enabledAgents.map((agent) => agent.name);
 		const hasWorker = agentNames.includes("worker");
 		const catalog = enabledAgents.length ? formatAgentCatalog(enabledAgents) : "- No enabled agents";
@@ -896,23 +956,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				};
 				assertEnabled();
 				const fresh = discoverAgents(executionCtx.cwd, executionCtx.isProjectTrusted());
-				const agent = fresh.agents.find((candidate) => candidate.name === params.agent);
-				if (!agent) {
+				const baseAgent = fresh.agents.find((candidate) => candidate.name === params.agent);
+				if (!baseAgent) {
 					const available = fresh.agents.filter((candidate) => !disabledAgents.has(candidate.name)).map((candidate) => candidate.name).join(", ") || "none";
 					throw new Error(`Unknown subagent "${params.agent}". Available agents: ${available}`);
 				}
 
+				const agent = baseAgent;
 				const defaults: DispatchDefaults = {
 					model: executionCtx.model
 						? `${executionCtx.model.provider}/${executionCtx.model.id}`
 						: undefined,
 					thinking: executionCtx.thinkingLevel,
 				};
+				const applyCurrentSettings = () => applyAgentSettings(
+					baseAgent,
+					selection.agentOverrides?.[baseAgent.name],
+					defaults,
+					(provider, id) => executionCtx.modelRegistry.find(provider, id),
+				);
+				const modelForAgent = (candidate: AgentConfig) => {
+					const reference = candidate.model ?? defaults.model;
+					if (!reference) return undefined;
+					const separator = reference.indexOf("/");
+					return separator < 1 ? undefined : executionCtx.modelRegistry.find(reference.slice(0, separator), reference.slice(separator + 1));
+				};
+				let dispatchedAgent = applyCurrentSettings();
+				const dispatchPriorityStatus = (candidate: AgentConfig) => formatPriority(candidate.priority, modelForAgent(candidate), candidate.model ?? defaults.model);
 				const run = (queuedDurationMs?: number) => {
 					// Selection may change while a mutating invocation waits in the queue.
 					assertEnabled();
+					dispatchedAgent = applyCurrentSettings();
 					return runChildAgent(
-						agent,
+						dispatchedAgent,
 						params.task,
 						executionCtx.cwd,
 						executionCtx.isProjectTrusted(),
@@ -920,34 +996,40 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						signal,
 						onUpdate,
 						activeChildren,
+						dispatchPriorityStatus(dispatchedAgent),
 						queuedDurationMs,
 					);
 				};
 				const onQueued = onUpdate
-					? (elapsedMs: number, queuedAt: number) => onUpdate({
-						content: [{ type: "text", text: "Waiting for writer queue" }],
-						details: {
-							status: "running",
-							agent: agent.name,
-							description: agent.description,
-							source: agent.source,
-							task: params.task,
-							model: agent.model ?? defaults.model ?? "unconfigured",
-							thinking: agent.thinking ?? defaults.thinking ?? "off",
-							tools: agent.tools ?? null,
-							fast: agent.fast,
-							mutating: agent.mutating,
-							queuedAt,
-							queuedDurationMs: elapsedMs,
-							liveStatus: "queued",
-							liveActivity: "Waiting for the writer queue",
-							activeTools: [],
-							messages: [],
-							timeline: [],
-							usage: emptyUsage(),
-							stderr: "",
-						},
-					})
+					? (elapsedMs: number, queuedAt: number) => {
+						const configured = applyCurrentSettings();
+						onUpdate({
+							content: [{ type: "text", text: "Waiting for writer queue" }],
+							details: {
+								status: "running",
+								agent: agent.name,
+								description: agent.description,
+								source: agent.source,
+								task: params.task,
+								model: configured.model ?? "unconfigured",
+								thinking: configured.thinking ?? "off",
+								tools: configured.tools ?? null,
+								fast: configured.fast,
+								priority: configured.priority,
+								priorityStatus: dispatchPriorityStatus(configured),
+								mutating: configured.mutating,
+								queuedAt,
+								queuedDurationMs: elapsedMs,
+								liveStatus: "queued",
+								liveActivity: "Waiting for the writer queue",
+								activeTools: [],
+								messages: [],
+								timeline: [],
+								usage: emptyUsage(),
+								stderr: "",
+							},
+						});
+					}
 					: undefined;
 				const childResult = await (agent.mutating ? enqueueMutating(run, signal, onQueued) : run());
 				const lastAssistant = getLastAssistant(childResult.messages);
@@ -975,15 +1057,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				if (truncated.fullOutputPath) temporaryOutputs.add(truncated.fullOutputPath);
 				const details: SubagentDetails = {
 					status: "completed",
-					agent: agent.name,
-					description: agent.description,
-					source: agent.source,
+					agent: dispatchedAgent.name,
+					description: dispatchedAgent.description,
+					source: dispatchedAgent.source,
 					task: params.task,
 					model: childResult.model,
 					thinking: childResult.thinking,
-					tools: agent.tools ?? null,
-					fast: agent.fast,
-					mutating: agent.mutating,
+					tools: dispatchedAgent.tools ?? null,
+					fast: dispatchedAgent.fast,
+					priority: dispatchedAgent.priority,
+					priorityStatus: dispatchPriorityStatus(dispatchedAgent),
+					mutating: dispatchedAgent.mutating,
 					startedAt: childResult.startedAt,
 					queuedDurationMs: childResult.queuedDurationMs,
 					durationMs: childResult.durationMs,
@@ -1021,8 +1105,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const icon = running ? theme.fg("warning", "⏳") : theme.fg("success", "✓");
 				const duration = details.durationMs === undefined ? "" : ` · ${(details.durationMs / 1_000).toFixed(1)}s child`;
 				const queuedDuration = details.queuedDurationMs === undefined ? "" : ` · ${(details.queuedDurationMs / 1_000).toFixed(1)}s queued`;
-				const fast = details.fast === undefined ? "unchanged" : details.fast ? "priority" : "default";
-				const header = `${icon} ${theme.fg("accent", theme.bold(details.agent))} ${theme.fg("muted", `${details.model}:${details.thinking} · fast: ${fast}${queuedDuration}${duration}`)}`;
+				const configuredPriority = details.priority ?? (details.fast === undefined ? undefined : details.fast ? "fast" : "default");
+				const priorityStatus = details.priorityStatus ?? configuredPriority ?? "unchanged";
+				const header = `${icon} ${theme.fg("accent", theme.bold(details.agent))} ${theme.fg("muted", `${details.model}:${details.thinking} · priority: ${priorityStatus}${queuedDuration}${duration}`)}`;
 
 				if (running) {
 					const activeTools = details.activeTools ?? [];
@@ -1115,9 +1200,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			warnings.push(error instanceof Error ? error.message : String(error));
 		}
 		try {
-			disabledAgents = new Set(restoreSelection(ctx.sessionManager.getBranch(), defaults).disabledAgents);
+			selection = restoreSelection(ctx.sessionManager.getBranch(), defaults);
+			disabledAgents = new Set(selection.disabledAgents);
 		} catch (error) {
-			disabledAgents = new Set(discovery.agents.map((agent) => agent.name));
+			selection = { disabledAgents: discovery.agents.map((agent) => agent.name) };
+			disabledAgents = new Set(selection.disabledAgents);
 			warnings.push(`Invalid session subagent selection: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		refreshTool(ctx);

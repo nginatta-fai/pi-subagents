@@ -4,11 +4,11 @@ An installable Pi package that lets the main agent autonomously delegate work to
 
 ## Included agents
 
-| Agent | Role | Model | Thinking | Service tier | Tools |
+| Agent | Role | Model | Thinking | Priority | Tools |
 |---|---|---|---|---|---|
-| `scout` | Fast codebase reconnaissance | `openai-codex/gpt-6-luna` | `low` | Priority | `read`, `grep`, `find`, `ls` |
-| `reviewer` | Independent correctness, security, and performance review | `openai-codex/gpt-6-sol` | `xhigh` | Standard | `read`, `grep`, `find` |
-| `worker` | Simple, high-performance autonomous implementation | `openai-codex/gpt-6-luna` | `xhigh` | Priority | all coding and search tools |
+| `scout` | Fast codebase reconnaissance | `openai-codex/gpt-6-luna` | `low` | Fast | `read`, `grep`, `find`, `ls` |
+| `reviewer` | Independent correctness, security, and performance review | `openai-codex/gpt-6.1-sol` | `xhigh` | Default | `read`, `grep`, `find` |
+| `worker` | Simple, high-performance autonomous implementation | `openai-codex/gpt-6.1-sol` | `xhigh` | Fast | all coding and search tools |
 
 The target machine must have authentication and model access configured for these models. You can override any bundled agent without modifying the package; see [Agent overrides](#agent-overrides).
 
@@ -19,19 +19,19 @@ The target machine must have authentication and model access configured for thes
 Push this repository to a Git host, tag a release, and install it globally:
 
 ```bash
-pi install git:github.com/nginatta-fai/pi-subagents@0.3.0
+pi install git:github.com/nginatta-fai/pi-subagents@0.4.0
 ```
 
 A raw Git URL also works:
 
 ```bash
-pi install https://github.com/nginatta-fai/pi-subagents@0.3.0
+pi install https://github.com/nginatta-fai/pi-subagents@0.4.0
 ```
 
 Use `-l` to record the package in the current project's `.pi/settings.json` instead of global settings:
 
 ```bash
-pi install git:github.com/nginatta-fai/pi-subagents@0.3.0 -l
+pi install git:github.com/nginatta-fai/pi-subagents@0.4.0 -l
 ```
 
 After changing installed resources, start a new Pi session or run `/reload`.
@@ -53,7 +53,7 @@ pi --no-extensions -e ./extensions/subagents/index.ts
 After publishing the package:
 
 ```bash
-pi install npm:pi-subagents@0.3.0
+pi install npm:pi-subagents@0.4.0
 ```
 
 Inspect and manage installations with:
@@ -76,7 +76,7 @@ Each invocation starts a separate ephemeral Pi process with:
 - an exact tool allowlist
 - the Markdown body of its agent file appended as its role prompt
 - no discovered extensions, skills, or prompt templates
-- an optional child-only OpenAI service-tier override when `fast` is configured
+- an optional child-only OpenAI service-tier override when `priority` (or legacy `fast`) is configured
 - no persisted child session
 - JSON event streaming back to the parent tool UI
 
@@ -103,24 +103,25 @@ Use the reviewer to review extensions/subagents/index.ts.
 
 ## Toggle subagents
 
-Run `/subagents` to open a searchable picker similar to `/scoped-models`:
+Run `/subagents` to open the searchable agent list. Enter opens the selected agent's settings; it never toggles the agent at the root:
 
-| Default key | Action |
-|---|---|
-| Up / Down | Select an agent |
-| Enter | Toggle the selected agent |
-| Type | Search names, descriptions, and models |
-| Ctrl+A | Enable all agents matching the search (all agents when empty) |
-| Ctrl+X | Disable all agents matching the search (all agents when empty) |
-| Ctrl+S | Save the selection as defaults for new sessions |
-| Escape | Close, keeping the current selection |
-| Ctrl+C | Clear the search, or close when empty |
+| Default key | Root list | Agent submenu |
+|---|---|---|
+| Up / Down | Select an agent | Select a setting |
+| Type | Search agents, descriptions, and current settings | Search settings or available models |
+| Right / Enter / Space | Open the selected agent | Open a choice or cycle forward |
+| Left | — | Cycle a setting backward; model choice goes back |
+| Escape / Ctrl+C | Close (Ctrl+C clears a non-empty root search first) | Return to the previous menu |
+| Ctrl+A / Ctrl+X | Enable / disable agents matching the root search | No bulk action |
+| Ctrl+S | Save complete settings as defaults | Save complete settings as defaults |
+
+Agent submenus contain Enabled, Model, Reasoning effort, Priority, and Reset to agent-file defaults. Model choices use the session's `/scoped-models` set when scoped, otherwise authenticated chat models; an unavailable or out-of-scope current value remains visible but is not offered as a new model. Reasoning choices are limited to levels supported by the selected model. Model and reasoning can be reset to agent-file defaults or explicitly inherit the parent session. Changes take effect immediately for new child dispatches and remain on the active session branch when the menu closes.
 
 The picker respects Pi's selection and scoped-model keybindings. Changes apply immediately and are stored on the current session branch, surviving `/reload`, resume, and fork. Navigating the session tree restores that branch's selection.
 
 Only enabled agents appear in the tool's catalogue and argument schema. Disabled agents cannot start new invocations, including invocations still waiting in the writer queue; already-running subagents are not cancelled. Disabling every agent removes the `subagent` tool until an agent is re-enabled, without changing other active tools.
 
-All agents are enabled by default. Ctrl+S writes `disabledAgents` to `~/.pi/agent/subagents.json` (or the directory set by `PI_CODING_AGENT_DIR`). Session selections take precedence over saved defaults. Names are shared across bundled, user, and project overrides; newly discovered names are enabled unless explicitly disabled. Invalid saved configuration produces a warning and disables agents unless the current branch has a valid selection.
+All agents are enabled by default. Ctrl+S writes the complete selection to `~/.pi/agent/subagents.json` (or the directory set by `PI_CODING_AGENT_DIR`): `disabledAgents` plus optional per-name `agentOverrides` for model, thinking, and priority. Legacy files containing only `disabledAgents` remain valid. Session selections take precedence over saved defaults. Names and overrides are retained even when an agent is not currently discovered; newly discovered names are enabled unless explicitly disabled. Invalid saved configuration produces a warning and disables agents unless the current branch has a valid selection. Reset removes only the session override and never edits agent Markdown.
 
 `/subagents list` shows enabled/disabled status without opening the picker. Outside TUI mode, `/subagents` also uses this listing behavior.
 
@@ -135,6 +136,7 @@ pi-subagents/
         ├── index.ts
         ├── agents.ts
         ├── openai-tier.ts
+        ├── priority.ts
         ├── selection.ts
         ├── selector.ts
         └── agents/
@@ -178,7 +180,7 @@ name: example
 description: Short routing description shown to the main model
 model: provider/model-id
 thinking: medium
-fast: true
+priority: fast
 tools: [read, grep, find, ls]
 mutating: false
 ---
@@ -188,9 +190,10 @@ The role-specific system prompt goes here.
 
 - Omitting `model` or `thinking` inherits the parent session's current value.
 - Omitting `tools` uses Pi's defaults; `tools: []` enables no tools.
-- `fast: true` requests OpenAI `service_tier: "priority"`; `fast: false` explicitly requests `service_tier: "default"`. An explicit `fast` setting takes precedence over a conflicting model `samplingParams.service_tier` while preserving other sampling parameters. Omitting `fast` adds no fast-mode override and leaves model sampling parameters unchanged. This setting is independent of the parent session's `/fast` mode.
-- Fast mode applies only to requests dispatched through `openai`/`openai-responses` or `openai-codex`/`openai-codex-responses`, including compatible endpoints registered under those provider IDs. It also covers Pi's built-in compaction and summarization requests when they use one of those model/API pairs. If a separate compaction model is used, that model's provider and API determine whether the tier applies; other providers, APIs, and models are unchanged. A thin child-only wrapper is applied to Pi's effective runtime providers after startup model selection, retaining persisted and refreshed catalogs, auth, models.json configuration, request handling, and usage accounting. The helper is explicitly loaded only in configured children, and child `--no-extensions` isolation remains in place.
-- Priority availability depends on provider, model, account eligibility, and endpoint support. Priority may cost more or consume a different quota; requesting it does not guarantee the provider will accept or honor it. Pi's native OpenAI Responses accounting uses the response's `service_tier`, falling back to the requested tier only when the response omits it; an explicit response tier of `default` is accounted as default. Native Codex accounting treats response `default` as the requested `priority`/`flex` tier when applicable, and falls back to the request tier when the response omits one. Both use Pi's model-specific multipliers and configured model costs, so usage estimates may differ from the endpoint's actual billing.
+- `priority` accepts `default`, `fast`, or `ultrafast`. `default` requests OpenAI `service_tier: "default"`; `fast` requests `service_tier: "priority"`; `ultrafast` requests `service_tier: "ultrafast"` only for `openai/gpt-6-astra` on `https://api.openai.com/v1` or `https://us.api.openai.com/v1` (optional trailing slash). No credentials, non-standard port, query, or fragment are accepted; Codex Astra is unverified. Ultrafast uses 6x Standard token prices for API Astra, and host cost estimates may exclude tier premiums.
+- The newer `priority` field supersedes legacy `fast`. Existing `fast: true` maps to `priority: fast`, and `fast: false` maps to `priority: default`; when both are omitted, no tier override is injected and model sampling parameters remain unchanged. Explicit priority takes precedence over conflicting `samplingParams.service_tier` while preserving other sampling parameters. This setting is independent of the parent session's `/fast` mode.
+- `default` and `fast` apply only to requests dispatched through `openai`/`openai-responses` or `openai-codex`/`openai-codex-responses`, including compatible endpoints registered under those provider IDs. Ultrafast is gated against every request model, including compaction and summarization, so a different model or endpoint never receives it. A thin child-only wrapper is applied to Pi's effective runtime providers after startup model selection, retaining persisted and refreshed catalogs, auth, models.json configuration, request handling, and usage accounting. The helper is explicitly loaded only in configured children, and child `--no-extensions` isolation remains in place.
+- Priority availability depends on provider, model, account eligibility, and endpoint support. Fast or ultrafast may cost more or consume a different quota; requesting a tier does not guarantee the provider will accept or honor it. Pi's native usage accounting uses model-specific multipliers and configured model costs; estimates may differ from endpoint billing and may not include tier premiums.
 - Agents with `mutating: true` are queued so two writers do not run simultaneously.
 - Agents with `bash`, `powershell`, `edit`, or `write` are always treated as mutating, even if their frontmatter says otherwise.
 - Child Pi processes use `--no-extensions`, preventing recursive delegation and inherited extension loading.
@@ -205,4 +208,4 @@ npm run check
 npm test
 ```
 
-Tests cover the picker, saved and branch-local selections, dynamic tool routing, dispatch guards, and fast-mode child processes against local simulated OpenAI Responses and Codex endpoints, including automatic compaction. They do not make paid network requests.
+Tests cover command and keyboard settings, saved and branch-local overrides, scoped-model behavior, dynamic tool routing, dispatch guards, legacy fast compatibility, and child processes against local simulated OpenAI Responses and Codex endpoints, including automatic compaction and ultrafast eligibility gating. They do not make paid network requests.
