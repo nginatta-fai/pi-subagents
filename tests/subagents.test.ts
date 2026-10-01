@@ -4,6 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getEventListeners } from "node:events";
 import { createServer } from "node:http";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import * as zlib from "node:zlib";
 import { test, type TestContext } from "node:test";
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type Theme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -987,6 +991,173 @@ test("legacy per-agent OpenAI settings and session model/thinking overrides reac
 	assert.equal(restoredResult.details.model, "other/fixture-model");
 	assert.equal(restoredResult.details.thinking, "off", "restored incompatible reasoning is clamped before child CLI dispatch");
 	assert.deepEqual(requests.filter((request) => request.task === "RESTORED_INCOMPATIBLE").map((request) => request.reasoning), [undefined]);
+});
+
+test("an installed package launches tiered children through the host Pi without package dependencies", async (t) => {
+	const root = temporaryDirectory(t);
+	const installed = path.join(root, "agent", "git", "github.com", "fixture", "pi-subagents");
+	fs.mkdirSync(installed, { recursive: true });
+	fs.copyFileSync(path.resolve("package.json"), path.join(installed, "package.json"));
+	fs.cpSync(path.resolve("extensions"), path.join(installed, "extensions"), { recursive: true });
+	assert.equal(fs.existsSync(path.join(installed, "node_modules")), false);
+	assert.throws(() => createRequire(path.join(installed, "extension.ts")).resolve("@earendil-works/pi-ai/api/simple-options"), /Cannot find module/);
+
+	fs.writeFileSync(path.join(root, "round-trip.txt"), "Installed child tool round trip.");
+	const requests: Array<Record<string, any>> = [];
+	const server = createServer(async (request, response) => {
+		const chunks: Buffer[] = [];
+		for await (const chunk of request) chunks.push(Buffer.from(chunk));
+		const raw = Buffer.concat(chunks);
+		const body = JSON.parse((request.headers["content-encoding"] === "zstd" ? zlib.zstdDecompressSync(raw) : raw).toString("utf8"));
+		requests.push(body);
+		const summary = JSON.stringify(body).includes("context summarization assistant");
+		const hasToolResult = body.input.some((item: any) => item.type === "function_call_output");
+		const dispatch = body.model === "fixture-parent" && !hasToolResult;
+		const readRoundTrip = body.model === "remote-only" && !hasToolResult;
+		const output = dispatch
+			? ["installed-fast", "installed-reported-default", "installed-default", "installed-codex", "installed-ultrafast"].map((agent, index) => ({
+				type: "function_call" as const, id: `fc_installed_${index}`, call_id: `call_installed_${index}`, name: "subagent",
+				arguments: JSON.stringify({ agent, task: "INSTALLED_PACKAGE_TASK" }),
+			}))
+			: readRoundTrip ? [{
+				type: "function_call" as const, id: "fc_installed_read", call_id: "call_installed_read", name: "read",
+				arguments: JSON.stringify({ path: path.join(root, "round-trip.txt") }),
+			}] : [{
+				type: "message" as const, id: `msg_installed_${requests.length}`, role: "assistant", status: "completed",
+				content: [{ type: "output_text", text: summary ? "## Goal\nContinue the task." : "installed child completed", annotations: [] }],
+			}];
+		const events = output.flatMap<object>((item, output_index) => item.type === "function_call" ? [
+			{ type: "response.output_item.added", output_index, item: { ...item, arguments: "" } },
+			{ type: "response.function_call_arguments.delta", output_index, delta: item.arguments },
+			{ type: "response.output_item.done", output_index, item },
+		] : [
+			{ type: "response.output_item.added", output_index, item: { ...item, content: [] } },
+			{ type: "response.output_text.delta", output_index, content_index: 0, delta: item.content![0].text },
+			{ type: "response.output_item.done", output_index, item },
+		]);
+		events.push({ type: "response.completed", response: {
+			id: `resp_installed_${requests.length}`, status: "completed", output,
+			usage: { input_tokens: readRoundTrip ? 20_000 : body.model.includes("compact") && !summary ? 900 : 10, output_tokens: 5, input_tokens_details: { cached_tokens: 0 } },
+			...(body.model.includes("reported-default") || body.model.includes("codex") ? { service_tier: "default" } : {}),
+		} });
+		response.writeHead(200, { "content-type": "text/event-stream", "x-installed-fixture": "true" });
+		response.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n");
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+	const baseUrl = `http://127.0.0.1:${(server.address() as import("node:net").AddressInfo).port}/v1`;
+	const localCli = path.resolve("node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+	const globalPi = (process.env.PATH ?? "").split(path.delimiter).map((directory) => path.join(directory, "pi"))
+		.find((candidate) => fs.existsSync(candidate));
+	const cliPaths = [...new Set([...(globalPi ? [fs.realpathSync(globalPi)] : []), localCli])];
+	for (const [index, cliPath] of cliPaths.entries()) {
+		const agentDir = path.join(root, `host-${index}`);
+		fs.mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+		const loaderProbe = path.join(agentDir, "load-installed.mjs");
+		const hostEntry = path.resolve(path.dirname(cliPath), "..", "index.js");
+		fs.writeFileSync(loaderProbe, `import { DefaultResourceLoader, SettingsManager } from ${JSON.stringify(pathToFileURL(hostEntry).href)};
+const loader = new DefaultResourceLoader({ cwd: ${JSON.stringify(root)}, agentDir: ${JSON.stringify(agentDir)}, settingsManager: SettingsManager.inMemory({}),
+  noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+  additionalExtensionPaths: [${JSON.stringify(path.join(installed, "extensions", "subagents", "openai-tier.ts"))}] });
+await loader.reload();
+console.log(JSON.stringify(loader.getExtensions().errors));
+process.exit(0);\n`);
+		const loaded = await promisify(execFile)(process.execPath, [loaderProbe], {
+			cwd: root, env: { PATH: process.env.PATH, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SUBAGENTS_OPENAI_SERVICE_TIER: "priority" }, timeout: 20_000,
+		});
+		assert.deepEqual(JSON.parse(loaded.stdout), [], `${cliPath}: ${loaded.stdout}${loaded.stderr}`);
+		const cost = { input: 7, output: 11, cacheRead: 0, cacheWrite: 0 };
+		const model = (id: string) => ({
+			id, name: id, api: "openai-responses", input: ["text"], reasoning: true,
+			contextWindow: id.includes("compact") ? 1_024 : 24_000, maxTokens: id.includes("compact") ? 512 : 1_500,
+			cost, samplingParams: { temperature: 0.15, service_tier: "flex" },
+		});
+		fs.writeFileSync(path.join(agentDir, "models.json"), JSON.stringify({ providers: {
+			openai: { baseUrl, apiKey: "isolated-fixture-key", api: "openai-responses", models: [model("fixture-parent"), model("reported-default"), model("compact-default"), model("gpt-6-astra")] },
+			"openai-codex": { baseUrl, models: [{ ...model("fixture-codex"), api: "openai-codex-responses" }] },
+		} }));
+		// The selected model exists only in the persisted remote catalog, not models.json.
+		fs.writeFileSync(path.join(agentDir, "models-store.json"), JSON.stringify({ openai: {
+			models: [{ ...model("remote-only"), provider: "openai" }], checkedAt: Date.now(), lastModified: Date.parse("2099-01-01"),
+		} }));
+		const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+		fs.writeFileSync(path.join(agentDir, "auth.json"), JSON.stringify({ "openai-codex": {
+			type: "oauth", access: `${encode({ alg: "none" })}.${encode({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })}.signature`,
+			refresh: "fixture-refresh", expires: Date.now() + 3_600_000, accountId: "fixture",
+		} }));
+		fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ transport: "sse", compaction: { reserveTokens: 128, keepRecentTokens: 1 } }));
+		for (const [name, target, priority] of [
+			["installed-fast", "openai/remote-only", "fast"],
+			["installed-reported-default", "openai/reported-default", "fast"],
+			["installed-default", "openai/compact-default", "default"],
+			["installed-codex", "openai-codex/fixture-codex", "fast"],
+			["installed-ultrafast", "openai/gpt-6-astra", "ultrafast"],
+		]) {
+			fs.writeFileSync(path.join(agentDir, "agents", `${name}.md`), [
+				"---", `name: ${name}`, `description: ${name}`, `model: ${target}`, `priority: ${priority}`, "thinking: high", name === "installed-fast" ? "tools: [read]" : "tools: []", "---", "Complete the fixture task.",
+			].join("\n"));
+		}
+		const resultPath = path.join(agentDir, "result.json");
+		const hooksPath = path.join(agentDir, "hooks.jsonl");
+		const hookExtension = path.join(agentDir, "hooks.ts");
+		fs.writeFileSync(hookExtension, `import fs from "node:fs";
+export default (pi) => {
+  const record = (kind) => fs.appendFileSync(${JSON.stringify(hooksPath)}, JSON.stringify({ kind }) + "\\n");
+  pi.on("before_provider_request", (event) => { record("payload"); return { ...event.payload, installed_hook: true }; });
+  pi.on("after_provider_response", () => record("response"));
+  pi.on("provider_stream_event", () => record("stream"));
+};\n`);
+		const driver = path.join(agentDir, "driver.ts");
+		fs.writeFileSync(driver, `import fs from "node:fs";
+export default (pi) => {
+  const results = [];
+  pi.on("session_start", () => pi.setActiveTools(["subagent"]));
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== "subagent") return;
+    results.push(event);
+    fs.writeFileSync(${JSON.stringify(resultPath)}, JSON.stringify(results));
+  });
+};\n`);
+		// Re-enter the actual CLI for children too; only the fixture hooks are explicitly added.
+		const launcher = path.join(agentDir, "pi-launcher.mjs");
+		fs.writeFileSync(launcher, `if (process.env.PI_SUBAGENT_DEPTH) process.argv.splice(2, 0, "--extension", ${JSON.stringify(hookExtension)});
+await import(${JSON.stringify(pathToFileURL(cliPath).href)});\n`);
+		const firstRequest = requests.length;
+		const execution = promisify(execFile)(process.execPath, [
+			launcher, "--mode", "json", "--print", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates",
+			"--extension", installed, "--extension", driver, "--model", "openai/fixture-parent", "--", "Dispatch the installed subagents.",
+		], {
+			cwd: root, env: { PATH: process.env.PATH, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_TELEMETRY: "0" }, timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
+		});
+		execution.child.stdin?.end();
+		const { stdout, stderr } = await execution;
+		assert.equal(fs.existsSync(resultPath), true, `${cliPath}\n${stdout}\n${stderr}`);
+		assert.doesNotMatch(stderr, /Failed to load extension|Cannot find module/);
+		const results = JSON.parse(fs.readFileSync(resultPath, "utf8"))
+			.sort((a: any, b: any) => a.toolCallId.localeCompare(b.toolCallId));
+		assert.equal(results.length, 5);
+		assert.ok(results.every((result: any) => !result.isError), JSON.stringify(results));
+		assert.deepEqual(results.map((result: any) => result.details.priority), ["fast", "fast", "default", "fast", "ultrafast"]);
+		assert.match(results[4].details.priorityStatus, /unsupported; not applied/);
+		assert.ok(Math.abs(results[0].details.usage.cost.total - 0.28036) < 1e-9, "missing response tier must use requested priority with the persisted model's native pricing");
+		assert.ok(Math.abs(results[1].details.usage.cost.total - 0.000125) < 1e-9, "OpenAI's reported default tier must remain authoritative");
+		assert.ok(Math.abs(results[3].details.usage.cost.total - 0.00025) < 1e-9, "Codex's reported default must retain requested priority accounting");
+		const hostRequests = requests.slice(firstRequest).filter((body) => body.model !== "fixture-parent");
+		assert.ok(hostRequests.every((body) => body.service_tier === (body.model === "compact-default" ? "default" : body.model === "gpt-6-astra" ? "flex" : "priority")), "explicit tier overrides conflicting sampling for chat and compaction, while unsupported ultrafast leaves model defaults untouched");
+		assert.ok(hostRequests.filter((body) => body.model !== "fixture-codex").every((body) => body.temperature === 0.15 && body.reasoning.effort === "high"));
+		assert.deepEqual(hostRequests.filter((body) => body.model === "remote-only").map((body) => body.max_output_tokens), [1_500, 16], "a tool round trip must retain the model output limit, then clamp against the latest native usage plus the trailing tool result");
+		assert.ok(results[0].details.messages.length > 1, "the installed child must complete its real read-tool round trip");
+		assert.ok(hostRequests.filter((body) => body.model === "compact-default").every((body) => body.max_output_tokens === 16), "small-context requests must retain the native safety clamp and API minimum");
+		assert.ok(hostRequests.some((body) => JSON.stringify(body).includes("context summarization assistant")), "the installed child must complete automatic compaction");
+		// Pi supplies extension instrumentation to agent turns, not summary calls.
+		const chatRequests = hostRequests.filter((body) => !JSON.stringify(body).includes("context summarization assistant"));
+		assert.equal(chatRequests.length, 6);
+		assert.ok(chatRequests.every((body) => body.installed_hook === true), "payload hook replacements must survive the tier wrapper");
+		const hooks = fs.readFileSync(hooksPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).kind);
+		assert.equal(hooks.filter((kind) => kind === "payload").length, chatRequests.length);
+		assert.equal(hooks.filter((kind) => kind === "response").length, chatRequests.length);
+		if (cliPath !== localCli) assert.ok(hooks.includes("stream"), "host provider stream hooks must survive simple option adaptation");
+	}
 });
 
 test("ultrafast tier reaches a native OpenAI request only for the API Astra model", async (t) => {
